@@ -125,6 +125,7 @@ fun TTSReaderApp() {
                 }
                 Screen.Upload -> {
                     UploadScreen(
+                        appPrefs = appPrefs,
                         onBookConverted = { book ->
                             bookManager.saveBook(book)
                             books = bookManager.getBooks()
@@ -158,14 +159,17 @@ fun TTSReaderApp() {
 
 @Composable
 fun UploadScreen(
+    appPrefs: AppPreferences,
     onBookConverted: (Book) -> Unit,
     onStream: (String) -> Unit,
     onCancel: () -> Unit
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var textState by remember { mutableStateOf(TextFieldValue("")) }
     var titleState by remember { mutableStateOf("") }
     var isLoading by remember { mutableStateOf(false) }
+    var loadingMessage by remember { mutableStateOf("Converting book...") }
     var showEmptyError by remember { mutableStateOf(false) }
 
     val filePicker = rememberLauncherForActivityResult(
@@ -191,7 +195,7 @@ fun UploadScreen(
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     CircularProgressIndicator()
                     Spacer(modifier = Modifier.height(16.dp))
-                    Text("Converting book...", style = MaterialTheme.typography.bodyLarge)
+                    Text(loadingMessage, style = MaterialTheme.typography.bodyLarge)
                 }
             }
         } else {
@@ -223,18 +227,52 @@ fun UploadScreen(
                 }
             }
             Spacer(modifier = Modifier.height(8.dp))
-            Button(
-                onClick = {
-                    if (titleState.isNotBlank() && textState.text.isNotBlank()) {
-                        showEmptyError = false
-                        onStream(textState.text)
-                    } else {
-                        showEmptyError = true
-                    }
-                },
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text("Stream Audio (Test)")
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                // Stream Button
+                Button(
+                    onClick = {
+                        if (titleState.isNotBlank() && textState.text.isNotBlank()) {
+                            showEmptyError = false
+                            onStream(textState.text)
+                        } else {
+                            showEmptyError = true
+                        }
+                    },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("Stream Audio")
+                }
+
+                // Download Button
+                Button(
+                    onClick = {
+                        if (titleState.isNotBlank() && textState.text.isNotBlank()) {
+                            showEmptyError = false
+                            isLoading = true
+                            scope.launch {
+                                try {
+                                    val convertedBook = ServerAPI.convertBook(
+                                        title = titleState,
+                                        text = textState.text,
+                                        context = context,
+                                        serverUrl = appPrefs.serverUrl,
+                                        onProgress = { message -> loadingMessage = message }
+                                    )
+                                    onBookConverted(convertedBook)
+                                } catch (e: Exception) {
+                                    // Handle error, maybe show a snackbar or dialog
+                                    loadingMessage = "Error: ${e.message}"
+                                    // Optionally, hide loading after a delay
+                                }
+                            }
+                        } else {
+                            showEmptyError = true
+                        }
+                    },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("Download & Save")
+                }
             }
         }
     }

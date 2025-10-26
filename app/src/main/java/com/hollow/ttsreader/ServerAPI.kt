@@ -16,6 +16,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import okhttp3.logging.HttpLoggingInterceptor
 import java.io.File
 import java.io.FileOutputStream
 import java.util.UUID
@@ -27,9 +28,12 @@ import java.util.zip.ZipInputStream
 // ==========================================
 object ServerAPI {
 
-    // REMOVED THE HARDCODED URL
+    private val loggingInterceptor = HttpLoggingInterceptor().apply {
+        level = HttpLoggingInterceptor.Level.BODY
+    }
 
     private val client = OkHttpClient.Builder()
+        .addInterceptor(loggingInterceptor)
         .connectTimeout(5, java.util.concurrent.TimeUnit.MINUTES)
         .readTimeout(10, java.util.concurrent.TimeUnit.MINUTES)
         .writeTimeout(5, java.util.concurrent.TimeUnit.MINUTES)
@@ -159,6 +163,27 @@ object ServerAPI {
             .build()
 
         client.newCall(request).execute()
+    }
+
+    suspend fun sendChunkReceivedConfirmation(serverUrl: String, sessionId: String, chunkIndex: Int) = withContext(Dispatchers.IO) {
+        try {
+            val jsonPayload = buildJsonObject {
+                put("session_id", sessionId)
+                put("chunk_index", chunkIndex)
+            }.toString()
+            val requestBody = jsonPayload.toRequestBody("application/json".toMediaType())
+            val request = Request.Builder()
+                .url("$serverUrl/chunk_received")
+                .post(requestBody)
+                .build()
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    // Log error or handle unsuccessful confirmation
+                }
+            }
+        } catch (e: Exception) {
+            // Handle network exception
+        }
     }
 
     private fun formatDuration(seconds: Int): String {
