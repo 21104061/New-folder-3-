@@ -162,7 +162,37 @@ object ServerAPI {
             .post(requestBody)
             .build()
 
-        client.newCall(request).execute()
+        // Retry loop for transient DNS/network issues
+        val maxRetries = 3
+        var attempt = 0
+        var lastException: Exception? = null
+
+        while (attempt < maxRetries) {
+            try {
+                return@withContext client.newCall(request).execute()
+            } catch (e: Exception) {
+                lastException = e
+                // If it's a DNS / UnknownHost, wait and retry a couple times before failing
+                if (e is java.net.UnknownHostException || e is java.net.SocketTimeoutException || e is java.io.IOException) {
+                    attempt++
+                    if (attempt >= maxRetries) break
+                    try {
+                        Thread.sleep((1000L * attempt))
+                    } catch (ie: InterruptedException) {
+                        // restore interrupt
+                        Thread.currentThread().interrupt()
+                        break
+                    }
+                    continue
+                } else {
+                    // Non-network exception, rethrow
+                    throw e
+                }
+            }
+        }
+
+        // If we reached here, retries exhausted
+        throw lastException ?: Exception("Unknown network error")
     }
 
     suspend fun sendChunkReceivedConfirmation(serverUrl: String, sessionId: String, chunkIndex: Int) = withContext(Dispatchers.IO) {

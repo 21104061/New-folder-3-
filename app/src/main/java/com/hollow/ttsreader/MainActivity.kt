@@ -368,7 +368,7 @@ fun SettingsScreen(appPrefs: AppPreferences, onSaved: () -> Unit) {
     var showUrlError by remember { mutableStateOf(false) }
 
     fun isValidUrl(url: String): Boolean {
-        return url.isNotBlank() && url.startsWith("https://") && url.endsWith(".trycloudflare.com")
+        return url.isNotBlank() && url.startsWith("http") && url.contains("playit.gg")
     }
 
     Column(
@@ -417,15 +417,15 @@ fun SettingsScreen(appPrefs: AppPreferences, onSaved: () -> Unit) {
                 connectionStatus = null
                 showUrlError = false
             },
-            label = { Text("Cloudflare Server URL") },
-            placeholder = { Text("https://xxxxx.trycloudflare.com") },
+            label = { Text("Playit.gg Server URL") },
+            placeholder = { Text("http://xxxxx.playit.gg") },
             leadingIcon = { Icon(Icons.Default.Link, contentDescription = null) },
             modifier = Modifier.fillMaxWidth(),
             singleLine = true,
             isError = showUrlError,
             supportingText = {
                 if (showUrlError) {
-                    Text("Please enter a valid Cloudflare URL (https://....trycloudflare.com)")
+                    Text("Please enter a valid Playit.gg URL")
                 }
             }
         )
@@ -518,8 +518,8 @@ fun SettingsScreen(appPrefs: AppPreferences, onSaved: () -> Unit) {
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
                     text = """1. Run the Python script in Google Colab.
-2. Wait for the URL like \'https://...trycloudflare.com\'.
-3. Copy the full URL.
+2. Wait for the URL from playit.gg tunnel.
+3. Copy the full URL (starting with http).
 4. Paste it into the field above.""",
                     style = MaterialTheme.typography.bodySmall,
                     lineHeight = 18.sp
