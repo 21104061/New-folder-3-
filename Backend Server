@@ -16,7 +16,7 @@ import subprocess # Import subprocess for running Piper
 # ========================================
 print("📦 Installing dependencies...")
 # Added requests for the new Step 5
-!pip install -q piper-tts flask flask-cors whisper-timestamped pyngrok requests
+!pip install -q piper-tts flask flask-cors whisper-timestamped pyngrok requests gender-guesser
 
 # --- ADDED DEPENDENCY CHECK ---
 try:
