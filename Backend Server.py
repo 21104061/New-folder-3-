@@ -60,7 +60,8 @@ basic_deps = [
     "numpy",
     "torch",
     "torchaudio",
-    "soundfile"
+    "soundfile",
+    "pyngrok"  # Added for Cloudflare tunnels
 ]
 
 print("Installing TTS dependencies...")
@@ -87,6 +88,7 @@ try:
     import requests
     import torch
     import numpy
+    import pyngrok
     print("✅ Basic dependencies verified")
     
     # Try importing piper (it might have a different import name)
@@ -102,9 +104,11 @@ except ImportError as e:
 
 
 # ========================================
-# STEP 2: Setup playit.gg Tunnel
+# STEP 2: Setup Tunnel
 # ========================================
-print("\n🌐 Setting up playit.gg Tunnel...")
+TUNNEL_TYPE = "cloudflare"  #@param ["cloudflare", "playit.gg"]
+
+print(f"\n🌐 Setting up {TUNNEL_TYPE} Tunnel...")
 
 def download_playit():
     # Define the download URL and target path
@@ -131,11 +135,10 @@ def download_playit():
         print(f"❌ Failed to download or set up playit.gg: {str(e)}")
         return False
 
-# Try to download playit.gg
-if not download_playit():
-    print("⚠️ Failed to download playit.gg. Please check your internet connection.")
-    sys.exit(1)
-
+if TUNNEL_TYPE == "playit.gg":
+    if not download_playit():
+        print("⚠️ Failed to download playit.gg. Please check your internet connection.")
+        sys.exit(1)
 
 # ========================================
 # STEP 3: Download Piper Voice Model
@@ -587,7 +590,7 @@ def stream():
 
 
 # ========================================
-# STEP 5: Start Server and playit.gg Tunnel
+# STEP 5: Start Server and Tunnel
 # ========================================
 
 def run_flask():
@@ -618,56 +621,71 @@ def start_tunnel_and_run_server():
     print("\n" + "="*50)
     print("🎉 FLASK SERVER IS LIVE ON PORT 5001")
     print("="*50)
-    print("\n🌐 Now starting playit.gg tunnel...")
     
-    # Start playit.gg with http tunneling for port 5001
-    playit_process = None
-    try:
-        # Run playit in a way that we can capture its output
-        playit_process = subprocess.Popen(
-            ["/content/playit", "tunnel", "http://localhost:5001"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True,
-            bufsize=1
-        )
-        
-        print("\n" + "="*50)
-        print("🔍 Waiting for playit.gg tunnel URL...")
-        
-        # Monitor the output to find the tunnel URL
-        while True:
-            output = playit_process.stdout.readline()
-            if output == '' and playit_process.poll() is not None:
-                break
-            if output:
-                print(output.strip())
-                # Look for the tunnel URL in the output
-                if "tunnel url:" in output.lower():
-                    tunnel_url = output.split("tunnel url:")[-1].strip()
-                    print("\n" + "="*50)
-                    print("🎉 SUCCESS! Server is accessible at:")
-                    print(f"➡️  {tunnel_url}")
-                    print("\n⚠️  Copy this URL into your Android app")
-                    print("="*50)
-                    break
-        
-        # Keep the process running
+    if TUNNEL_TYPE == "cloudflare":
+        print(f"\n🌐 Now starting {TUNNEL_TYPE} tunnel...")
         try:
-            playit_process.wait()
-        except KeyboardInterrupt:
-            print("\nShutting down server...")
+            public_url = pyngrok.connect(5001)
+            print("\n" + "="*50)
+            print("🎉 SUCCESS! Server is accessible at:")
+            print(f"➡️  {public_url}")
+            print("\n⚠️  Copy this URL into your Android app")
+            print("="*50)
+            # Keep the main thread alive to keep the tunnel open
+            flask_thread.join()
+        except Exception as e:
+            print(f"\n❌ Error starting Cloudflare tunnel: {str(e)}")
+            raise
+
+    elif TUNNEL_TYPE == "playit.gg":
+        print(f"\n🌐 Now starting {TUNNEL_TYPE} tunnel...")
+        playit_process = None
+        try:
+            # Run playit in a way that we can capture its output
+            playit_process = subprocess.Popen(
+                ["/content/playit", "tunnel", "http://localhost:5001"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                bufsize=1
+            )
+            
+            print("\n" + "="*50)
+            print("🔍 Waiting for playit.gg tunnel URL...")
+            
+            # Monitor the output to find the tunnel URL
+            while True:
+                output = playit_process.stdout.readline()
+                if output == '' and playit_process.poll() is not None:
+                    break
+                if output:
+                    print(output.strip())
+                    # Look for the tunnel URL in the output
+                    if "tunnel url:" in output.lower():
+                        tunnel_url = output.split("tunnel url:")[-1].strip()
+                        print("\n" + "="*50)
+                        print("🎉 SUCCESS! Server is accessible at:")
+                        print(f"➡️  {tunnel_url}")
+                        print("\n⚠️  Copy this URL into your Android app")
+                        print("="*50)
+                        break
+            
+            # Keep the process running
+            try:
+                playit_process.wait()
+            except KeyboardInterrupt:
+                print("\nShutting down server...")
+                if playit_process:
+                    playit_process.terminate()
+                    playit_process.wait()
+                print("✅ Server shut down.")
+                
+        except Exception as e:
+            print(f"\n❌ Error starting playit.gg tunnel: {str(e)}")
             if playit_process:
                 playit_process.terminate()
                 playit_process.wait()
-            print("✅ Server shut down.")
-            
-    except Exception as e:
-        print(f"\n❌ Error starting playit.gg tunnel: {str(e)}")
-        if playit_process:
-            playit_process.terminate()
-            playit_process.wait()
-        raise
+            raise
 
 # Start the tunnel and keep the script alive
 start_tunnel_and_run_server()
