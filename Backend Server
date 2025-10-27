@@ -171,6 +171,289 @@ os.makedirs(WORK_DIR, exist_ok=True)
 
 print("\n✅ Server initialized!")
 
+# ========================================
+# Multi-Speaker Detection & Voice Assignment Functions
+# ========================================
+
+import re
+import gender_guesser.detector as gender
+
+# Initialize gender detector
+gender_detector = gender.Detector()
+
+def detect_speakers(text):
+    """
+    Detect speakers in text and segment text by speaker.
+    Returns: (speakers_list, segments_list)
+    """
+    speakers = [{"id": "narrator", "name": "Narrator"}]
+    segments = []
+    speaker_names = {}  # Track unique speakers by name
+
+    # Regex patterns for speaker detection
+    # Pattern 1: "dialog", said Name
+    pattern1 = re.compile(r'"([^"]+)",?\s+(?:said|asked|replied|shouted|whispered|exclaimed|answered|called)\s+([A-Z][a-z]+)')
+    # Pattern 2: Name said, "dialog"
+    pattern2 = re.compile(r'([A-Z][a-z]+)\s+(?:said|asked|replied|shouted|whispered|exclaimed|answered|called),?\s+"([^"]+)"')
+    # Pattern 3: Script format - NAME: dialog
+    pattern3 = re.compile(r'^([A-Z][A-Z\s]+):\s*(.+)$', re.MULTILINE)
+    # Pattern 4: Quoted dialog without attribution
+    pattern4 = re.compile(r'"([^"]+)"')
+
+    last_speaker = "narrator"
+    current_pos = 0
+    matches = []
+
+    # Find all matches with all patterns
+    for match in pattern1.finditer(text):
+        dialog, speaker = match.groups()
+        matches.append((match.start(), match.end(), speaker, dialog, 'pattern1'))
+
+    for match in pattern2.finditer(text):
+        speaker, dialog = match.groups()
+        matches.append((match.start(), match.end(), speaker, dialog, 'pattern2'))
+
+    for match in pattern3.finditer(text):
+        speaker, dialog = match.groups()
+        speaker = speaker.strip().title()  # Normalize script format names
+        matches.append((match.start(), match.end(), speaker, dialog, 'pattern3'))
+
+    # Sort matches by position
+    matches.sort(key=lambda x: x[0])
+
+    # Process matches and build segments
+    for start, end, speaker_name, dialog, pattern_type in matches:
+        # Add narrator segment for text before this match
+        if current_pos < start:
+            narrator_text = text[current_pos:start].strip()
+            if narrator_text:
+                segments.append({
+                    "speaker_id": "narrator",
+                    "text": narrator_text,
+                    "start": current_pos,
+                    "end": start
+                })
+
+        # Register speaker if new
+        if speaker_name not in speaker_names:
+            speaker_id = f"speaker_{len(speakers)}"
+            speaker_names[speaker_name] = speaker_id
+            speakers.append({"id": speaker_id, "name": speaker_name})
+        else:
+            speaker_id = speaker_names[speaker_name]
+
+        # Add speaker segment with dialog only
+        segments.append({
+            "speaker_id": speaker_id,
+            "text": dialog.strip(),
+            "start": start,
+            "end": end
+        })
+
+        last_speaker = speaker_id
+        current_pos = end
+
+    # Add remaining text as narrator
+    if current_pos < len(text):
+        narrator_text = text[current_pos:].strip()
+        if narrator_text:
+            segments.append({
+                "speaker_id": "narrator",
+                "text": narrator_text,
+                "start": current_pos,
+                "end": len(text)
+            })
+
+    # If no speakers detected (only narrator), return single voice mode
+    if len(speakers) == 1:
+        return speakers, [{"speaker_id": "narrator", "text": text, "start": 0, "end": len(text)}]
+
+    return speakers, segments
+
+def detect_gender(speaker_name, text_context):
+    """
+    Detect gender of speaker using name and pronoun analysis.
+    Returns: "male", "female", or "neutral"
+    """
+    if speaker_name == "Narrator":
+        return "neutral"
+
+    # Method 1: Name-based detection
+    gender_result = gender_detector.get_gender(speaker_name)
+
+    if gender_result in ['male', 'mostly_male']:
+        return "male"
+    elif gender_result in ['female', 'mostly_female']:
+        return "female"
+
+    # Method 2: Pronoun analysis in context
+    male_pronouns = len(re.findall(r'\b(he|him|his|himself)\b', text_context, re.IGNORECASE))
+    female_pronouns = len(re.findall(r'\b(she|her|hers|herself)\b', text_context, re.IGNORECASE))
+
+    if male_pronouns > female_pronouns:
+        return "male"
+    elif female_pronouns > male_pronouns:
+        return "female"
+
+    # Default to neutral if ambiguous
+    return "neutral"
+
+def detect_age(speaker_name, text_context):
+    """
+    Detect age category of speaker using contextual keywords.
+    Returns: "child", "young_adult", "adult", or "elderly"
+    """
+    if speaker_name == "Narrator":
+        return "adult"
+
+    context_lower = text_context.lower()
+
+    # Child indicators
+    child_keywords = r'\b(child|kid|boy|girl|little|young child|toddler|baby|son|daughter)\b'
+    if re.search(child_keywords, context_lower):
+        return "child"
+
+    # Elderly indicators
+    elderly_keywords = r'\b(old|elderly|aged|senior|grandfather|grandmother|grandpa|grandma|ancient|elder)\b'
+    if re.search(elderly_keywords, context_lower):
+        return "elderly"
+
+    # Young adult indicators
+    young_keywords = r'\b(teenager|teen|young man|young woman|youth|adolescent|student|college|young)\b'
+    if re.search(young_keywords, context_lower):
+        return "young_adult"
+
+    # Default to adult
+    return "adult"
+
+def assign_voice(gender, age_category, used_voices):
+    """
+    Assign appropriate voice model based on gender and age.
+    Returns: voice_model_path
+    """
+    # Voice model pools
+    voice_pools = {
+        "neutral_adult": ["/content/piper_models/en_US-lessac-medium.onnx"],
+        "male_adult": [
+            "/content/piper_models/en_US-danny-medium.onnx",
+            "/content/piper_models/en_US-hfc_male-medium.onnx",
+            "/content/piper_models/en_GB-alan-medium.onnx"
+        ],
+        "female_adult": [
+            "/content/piper_models/en_US-amy-medium.onnx",
+            "/content/piper_models/en_GB-jenny_dioco-medium.onnx",
+            "/content/piper_models/en_GB-alba-medium.onnx"
+        ],
+        "male_young_adult": [
+            "/content/piper_models/en_US-bryce-medium.onnx",
+            "/content/piper_models/en_GB-northern_english_male-medium.onnx"
+        ],
+        "female_young_adult": [
+            "/content/piper_models/en_US-hfc_female-medium.onnx",
+            "/content/piper_models/en_GB-cori-medium.onnx"
+        ],
+        "male_child": [
+            "/content/piper_models/en_US-bryce-medium.onnx",
+            "/content/piper_models/en_GB-northern_english_male-medium.onnx"
+        ],
+        "female_child": [
+            "/content/piper_models/en_US-hfc_female-medium.onnx",
+            "/content/piper_models/en_GB-cori-medium.onnx"
+        ],
+        "male_elderly": [
+            "/content/piper_models/en_US-arctic-medium.onnx"
+        ],
+        "female_elderly": [
+            "/content/piper_models/en_GB-aru-medium.onnx"
+        ]
+    }
+
+    # Build category key
+    category = f"{gender}_{age_category}"
+
+    # Get voice pool for this category
+    pool = voice_pools.get(category, voice_pools["neutral_adult"])
+
+    # Find first unused voice in pool, or reuse if all used
+    for voice in pool:
+        if voice not in used_voices.values():
+            return voice
+
+    # All voices used, return first in pool (reuse)
+    return pool[0]
+
+def generate_segment_audio(text, voice_model, output_file):
+    """
+    Generate audio for a single text segment using specified voice model.
+    Returns: True on success, False on failure
+    """
+    try:
+        # Create temp text file for segment
+        temp_text_file = f"{output_file}.txt"
+        with open(temp_text_file, 'w', encoding='utf-8') as f:
+            f.write(text)
+
+        # Run Piper TTS
+        piper_cmd = f"piper --model {voice_model} --output_file {output_file} < {temp_text_file}"
+        result = subprocess.run(piper_cmd, shell=True, capture_output=True)
+
+        # Clean up temp text file
+        if os.path.exists(temp_text_file):
+            os.remove(temp_text_file)
+
+        if result.returncode != 0:
+            try:
+                error_message = result.stderr.decode('utf-8', errors='replace')
+            except Exception:
+                error_message = "Undecodable Piper stderr output"
+            print(f"❌ Piper error for segment: {error_message}")
+            return False
+
+        return os.path.exists(output_file)
+
+    except Exception as e:
+        print(f"❌ Error generating segment audio: {e}")
+        return False
+
+def concatenate_audio_segments(segment_files, output_file):
+    """
+    Concatenate multiple WAV files into one using ffmpeg.
+    Returns: True on success, False on failure
+    """
+    try:
+        # Create concat list file
+        concat_list = f"{output_file}.concat.txt"
+        with open(concat_list, 'w', encoding='utf-8') as f:
+            for seg_file in segment_files:
+                # Use absolute path and escape for ffmpeg
+                f.write(f"file '{seg_file}'\n")
+
+        # Run ffmpeg concat
+        ffmpeg_cmd = f"ffmpeg -f concat -safe 0 -i {concat_list} -c copy {output_file} -y"
+        result = subprocess.run(ffmpeg_cmd, shell=True, capture_output=True)
+
+        # Clean up concat list
+        if os.path.exists(concat_list):
+            os.remove(concat_list)
+
+        if result.returncode != 0:
+            try:
+                error_message = result.stderr.decode('utf-8', errors='replace')
+            except Exception:
+                error_message = "Undecodable ffmpeg stderr output"
+            print(f"❌ FFmpeg concatenation error: {error_message}")
+            return False
+
+        return os.path.exists(output_file)
+
+    except Exception as e:
+        print(f"❌ Error concatenating audio segments: {e}")
+        return False
+
+# ========================================
+# Flask Endpoints
+# ========================================
+
 # Health check endpoint
 @app.route('/', methods=['GET'])
 def health_check():
