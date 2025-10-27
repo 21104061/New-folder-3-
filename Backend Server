@@ -61,6 +61,63 @@ os.makedirs("/content/piper_models", exist_ok=True)
 !wget -q -O /content/piper_models/en_US-lessac-medium.onnx.json \
   https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json
 
+# ========================================
+# STEP 3.5: Download Additional Voice Models for Multi-Speaker Support
+# ========================================
+print("\n🎭 Downloading additional voice models for multi-speaker support...")
+
+voice_models = [
+    # Male Adult voices
+    ("en_US-danny-medium", "en/en_US/danny/medium/"),
+    ("en_US-hfc_male-medium", "en/en_US/hfc_male/medium/"),
+    ("en_GB-alan-medium", "en/en_GB/alan/medium/"),
+
+    # Female Adult voices
+    ("en_US-amy-medium", "en/en_US/amy/medium/"),
+    ("en_GB-jenny_dioco-medium", "en/en_GB/jenny_dioco/medium/"),
+    ("en_GB-alba-medium", "en/en_GB/alba/medium/"),
+
+    # Young Adult voices
+    ("en_US-bryce-medium", "en/en_US/bryce/medium/"),
+    ("en_GB-northern_english_male-medium", "en/en_GB/northern_english_male/medium/"),
+    ("en_US-hfc_female-medium", "en/en_US/hfc_female/medium/"),
+    ("en_GB-cori-medium", "en/en_GB/cori/medium/"),
+
+    # Elderly voices
+    ("en_US-arctic-medium", "en/en_US/arctic/medium/"),
+    ("en_GB-aru-medium", "en/en_GB/aru/medium/")
+]
+
+base_url = "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+downloaded_count = 0
+
+for model_name, path in voice_models:
+    model_file = f"/content/piper_models/{model_name}.onnx"
+    config_file = f"/content/piper_models/{model_name}.onnx.json"
+
+    # Skip if already exists
+    if os.path.exists(model_file) and os.path.exists(config_file):
+        print(f"   ✅ {model_name} already exists")
+        continue
+
+    try:
+        # Download model file
+        model_url = f"{base_url}{path}{model_name}.onnx"
+        config_url = f"{base_url}{path}{model_name}.onnx.json"
+
+        os.system(f"wget -q -O {model_file} {model_url}")
+        os.system(f"wget -q -O {config_file} {config_url}")
+
+        if os.path.exists(model_file) and os.path.exists(config_file):
+            print(f"   ✅ Downloaded {model_name}")
+            downloaded_count += 1
+        else:
+            print(f"   ❌ Failed to download {model_name}")
+    except Exception as e:
+        print(f"   ❌ Error downloading {model_name}: {e}")
+
+print(f"\n✅ Multi-speaker setup complete! Downloaded {downloaded_count} new voice models")
+
 # --- ADDED MODEL CHECK ---
 PIPER_MODEL = "/content/piper_models/en_US-lessac-medium.onnx"
 PIPER_CONFIG = "/content/piper_models/en_US-lessac-medium.onnx.json"
