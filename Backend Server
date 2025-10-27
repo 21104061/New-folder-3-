@@ -522,7 +522,112 @@ def convert_text_to_audio():
             f.write(clean_text)
 
         # =====================================
-        # STEP 1: Generate Audio with Piper TTS
+        # PHASE 1: Multi-Speaker Text Analysis
+        # =====================================
+        print("\n🎭 Analyzing speakers in text...")
+
+        try:
+            # Detect speakers and segments
+            speakers, segments = detect_speakers(clean_text)
+            print(f"   Detected {len(speakers)} speakers")
+
+            # Analyze each speaker for gender and age
+            speaker_metadata = {}
+            used_voices = {}
+
+            for speaker in speakers:
+                speaker_id = speaker['id']
+                speaker_name = speaker['name']
+
+                # Get context for this speaker (surrounding text)
+                context_window = 200
+                speaker_segments_text = ""
+
+                for segment in segments:
+                    if segment['speaker_id'] == speaker_id:
+                        start = max(0, segment['start'] - context_window)
+                        end = min(len(clean_text), segment['end'] + context_window)
+                        speaker_segments_text += clean_text[start:end] + " "
+
+                # Detect gender and age
+                gender = detect_gender(speaker_name, speaker_segments_text)
+                age = detect_age(speaker_name, speaker_segments_text)
+
+                # Assign voice
+                voice_model = assign_voice(gender, age, used_voices)
+                used_voices[speaker_id] = voice_model
+
+                speaker_metadata[speaker_id] = {
+                    "name": speaker_name,
+                    "gender": gender,
+                    "age": age,
+                    "voice_model": voice_model
+                }
+
+                print(f"   {speaker_name}: {gender} {age} → {os.path.basename(voice_model)}")
+
+            # Determine if multi-speaker mode
+            multi_speaker_mode = len([s for s in speakers if s['id'] != 'narrator']) > 0
+
+            if not multi_speaker_mode:
+                print("   No speakers detected - using single voice mode")
+                # Fallback to original single-voice processing
+                speakers_metadata_json = {
+                    "mode": "single_voice",
+                    "reason": "No speakers detected",
+                    "total_speakers": 1,
+                    "speakers": [
+                        {
+                            "id": "narrator",
+                            "name": "Narrator",
+                            "gender": "neutral",
+                            "age": "adult",
+                            "voice_model": "en_US-lessac-medium"
+                        }
+                    ],
+                    "segments_count": 1
+                }
+            else:
+                print(f"   Multi-speaker mode enabled with {len(segments)} segments")
+                speakers_metadata_json = {
+                    "mode": "multi_voice",
+                    "total_speakers": len(speakers),
+                    "speakers": [
+                        {
+                            "id": speaker_id,
+                            "name": metadata["name"],
+                            "gender": metadata["gender"],
+                            "age": metadata["age"],
+                            "voice_model": os.path.basename(metadata["voice_model"])
+                        }
+                        for speaker_id, metadata in speaker_metadata.items()
+                    ],
+                    "segments_count": len(segments)
+                }
+
+        except Exception as e:
+            print(f"   ⚠️ Speaker analysis failed: {e}")
+            print("   Falling back to single voice mode")
+            # Fallback to single voice
+            multi_speaker_mode = False
+            speakers_metadata_json = {
+                "mode": "single_voice",
+                "reason": f"Speaker analysis failed: {str(e)}",
+                "total_speakers": 1,
+                "speakers": [
+                    {
+                        "id": "narrator",
+                        "name": "Narrator",
+                        "gender": "neutral",
+                        "age": "adult",
+                        "voice_model": "en_US-lessac-medium"
+                    }
+                ],
+                "segments_count": 1
+            }
+
+        # =====================================
+        # PHASE 2: Generate Audio (Multi-Voice or Single-Voice)
         # =====================================
         print("\n🎵 Generating audio with Piper TTS...")
         # Removed text=True to handle potential binary output correctly in case of errors
