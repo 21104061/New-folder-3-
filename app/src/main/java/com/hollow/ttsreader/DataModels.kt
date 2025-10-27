@@ -17,16 +17,27 @@ data class Book(
     val textPath: String,
     val wordCount: Int,
     val duration: String,
-    val dateAdded: Long = System.currentTimeMillis()
+    val dateAdded: Long = System.currentTimeMillis(),
+    val status: BookStatus = BookStatus.READY // NEW FIELD
 ) {
     fun getText(): String {
         return File(textPath).readText()
     }
 
     fun getTimestamps(): List<WordTimestamp> {
+        if (!File(timestampsPath).exists()) return emptyList()
         val json = File(timestampsPath).readText()
         return Json.decodeFromString<List<WordTimestamp>>(json)
     }
+}
+
+// NEW: Book status enum
+@Serializable
+enum class BookStatus {
+    CONVERTING,  // Server is processing
+    DOWNLOADING, // Downloading from server
+    READY,       // Ready to play
+    ERROR        // Conversion failed
 }
 
 // Data class for a single word with its timestamp
@@ -91,5 +102,20 @@ class BookManager(private val context: Context) {
 
     fun createBookDirectory(bookId: String): File {
         return File(booksDir, bookId).apply { mkdirs() }
+    }
+
+    fun updateBookStatus(bookId: String, status: BookStatus) {
+        val currentBooks = getBooks().toMutableList()
+        val index = currentBooks.indexOfFirst { it.id == bookId }
+        
+        if (index != -1) {
+            currentBooks[index] = currentBooks[index].copy(status = status)
+            val jsonString = Json.encodeToString(currentBooks)
+            metadataFile.writeText(jsonString)
+        }
+    }
+
+    fun getBook(bookId: String): Book? {
+        return getBooks().find { it.id == bookId }
     }
 }

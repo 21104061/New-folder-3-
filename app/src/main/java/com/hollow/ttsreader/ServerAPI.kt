@@ -68,7 +68,25 @@ object ServerAPI {
 
         if (!response.isSuccessful) {
             val errorBody = response.body?.string() ?: "Unknown error"
-            throw Exception("Server error ${response.code}: $errorBody")
+            
+            // Try to parse JSON error response
+            try {
+                val errorJson = json.decodeFromString<Map<String, String>>(errorBody)
+                val errorMsg = errorJson["error"] ?: errorBody
+                val segment = errorJson["segment"] ?: ""
+                val speaker = errorJson["speaker"] ?: ""
+                
+                val detailedError = if (segment.isNotEmpty() && speaker.isNotEmpty()) {
+                    "Failed at segment $segment ($speaker): $errorMsg"
+                } else {
+                    errorMsg
+                }
+                
+                throw Exception(detailedError)
+            } catch (e: Exception) {
+                // If JSON parsing fails, use raw error body
+                throw Exception("Server error ${response.code}: $errorBody")
+            }
         }
 
         onProgress("Downloading converted files...")
@@ -144,6 +162,27 @@ object ServerAPI {
             wordCount = wordCount,
             duration = durationFormatted
         )
+    }
+
+    suspend fun convertBookRaw(
+        title: String,
+        text: String,
+        serverUrl: String
+    ): Response = withContext(Dispatchers.IO) {
+        // Create JSON payload
+        val jsonPayload = buildJsonObject {
+            put("title", title)
+            put("text", text)
+        }.toString()
+
+        val requestBody = jsonPayload.toRequestBody("application/json".toMediaType())
+
+        val request = Request.Builder()
+            .url("$serverUrl/convert")
+            .post(requestBody)
+            .build()
+
+        client.newCall(request).execute()
     }
 
     suspend fun streamAudio(

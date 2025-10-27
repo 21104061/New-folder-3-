@@ -25,9 +25,14 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkManager
+import androidx.work.workDataOf
 import com.hollow.ttsreader.TTSReaderTheme
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import java.util.*
+import java.io.File
+import java.util.UUID
 // --- IMPORTS END HERE ---
 
 class MainActivity : ComponentActivity() {
@@ -171,6 +176,8 @@ fun UploadScreen(
     var isLoading by remember { mutableStateOf(false) }
     var loadingMessage by remember { mutableStateOf("Converting book...") }
     var showEmptyError by remember { mutableStateOf(false) }
+    var showError by remember { mutableStateOf(false) }
+    var errorMessage by remember { mutableStateOf("") }
 
     val filePicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
@@ -196,6 +203,41 @@ fun UploadScreen(
                     CircularProgressIndicator()
                     Spacer(modifier = Modifier.height(16.dp))
                     Text(loadingMessage, style = MaterialTheme.typography.bodyLarge)
+                }
+            }
+        } else if (showError) {
+            // Show error message
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(16.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                Icon(
+                    Icons.Default.Error,
+                    contentDescription = null,
+                    modifier = Modifier.size(64.dp),
+                    tint = MaterialTheme.colorScheme.error
+                )
+                Spacer(modifier = Modifier.height(16.dp))
+                Text(
+                    "Conversion Failed",
+                    style = MaterialTheme.typography.titleLarge,
+                    color = MaterialTheme.colorScheme.error
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    errorMessage,
+                    style = MaterialTheme.typography.bodyMedium,
+                    textAlign = TextAlign.Center
+                )
+                Spacer(modifier = Modifier.height(24.dp))
+                Button(onClick = { 
+                    showError = false
+                    errorMessage = ""
+                }) {
+                    Text("Try Again")
                 }
             }
         } else {
@@ -248,21 +290,57 @@ fun UploadScreen(
                     onClick = {
                         if (titleState.isNotBlank() && textState.text.isNotBlank()) {
                             showEmptyError = false
-                            isLoading = true
+                            
                             scope.launch {
                                 try {
-                                    val convertedBook = ServerAPI.convertBook(
+                                    // Create book immediately with CONVERTING status
+                                    val bookId = UUID.randomUUID().toString()
+                                    val bookManager = BookManager(context)
+                                    val bookDir = bookManager.createBookDirectory(bookId)
+                                    
+                                    // Save text file immediately
+                                    val textFile = File(bookDir, "book_text.txt")
+                                    textFile.writeText(textState.text)
+                                    
+                                    // Calculate word count
+                                    val wordCount = textState.text.split(Regex("\\s+")).size
+                                    
+                                    // Create placeholder book with CONVERTING status
+                                    val placeholderBook = Book(
+                                        id = bookId,
                                         title = titleState,
-                                        text = textState.text,
-                                        context = context,
-                                        serverUrl = appPrefs.serverUrl,
-                                        onProgress = { message -> loadingMessage = message }
+                                        audioPath = "",  // Will be filled later
+                                        timestampsPath = "",
+                                        textPath = textFile.absolutePath,
+                                        wordCount = wordCount,
+                                        duration = "",
+                                        status = BookStatus.CONVERTING
                                     )
-                                    onBookConverted(convertedBook)
+                                    
+                                    // Save to library
+                                    bookManager.saveBook(placeholderBook)
+                                    
+                                    // Schedule background conversion
+                                    val workRequest = OneTimeWorkRequestBuilder<ConversionWorker>()
+                                        .setInputData(
+                                            workDataOf(
+                                                ConversionWorker.KEY_BOOK_ID to bookId,
+                                                ConversionWorker.KEY_BOOK_TITLE to titleState,
+                                                ConversionWorker.KEY_BOOK_TEXT to textState.text,
+                                                ConversionWorker.KEY_SERVER_URL to appPrefs.serverUrl,
+                                                ConversionWorker.KEY_WORD_COUNT to wordCount
+                                            )
+                                        )
+                                        .build()
+                                    
+                                    WorkManager.getInstance(context).enqueue(workRequest)
+                                    
+                                    // Navigate back to library
+                                    onCancel()
+                                    
                                 } catch (e: Exception) {
-                                    // Handle error, maybe show a snackbar or dialog
-                                    loadingMessage = "Error: ${e.message}"
-                                    // Optionally, hide loading after a delay
+                                    println("Error starting conversion: ${e.message}")
+                                    e.printStackTrace()
                                 }
                             }
                         } else {
@@ -284,6 +362,20 @@ fun LibraryScreen(
     onBookClick: (Book) -> Unit,
     onRefresh: () -> Unit
 ) {
+    // Auto-refresh every 2 seconds if there are converting books
+    val hasConvertingBooks = books.any { 
+        it.status == BookStatus.CONVERTING || it.status == BookStatus.DOWNLOADING 
+    }
+    
+    LaunchedEffect(hasConvertingBooks) {
+        if (hasConvertingBooks) {
+            while (true) {
+                delay(2000) // Refresh every 2 seconds
+                onRefresh()
+            }
+        }
+    }
+    
     LaunchedEffect(Unit) {
         onRefresh()
     }
@@ -312,7 +404,14 @@ fun LibraryScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             items(books) { book ->
-                BookCard(book = book, onClick = { onBookClick(book) })
+                BookCard(
+                    book = book,
+                    onClick = {
+                        if (book.status == BookStatus.READY) {
+                            onBookClick(book)
+                        }
+                    }
+                )
             }
         }
     }
@@ -320,11 +419,23 @@ fun LibraryScreen(
 
 @Composable
 fun BookCard(book: Book, onClick: () -> Unit) {
+    val isClickable = book.status == BookStatus.READY
+    
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick),
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+            .clickable(enabled = isClickable, onClick = onClick),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = when (book.status) {
+                BookStatus.CONVERTING, BookStatus.DOWNLOADING -> 
+                    MaterialTheme.colorScheme.surfaceVariant
+                BookStatus.ERROR -> 
+                    MaterialTheme.colorScheme.errorContainer
+                else -> 
+                    MaterialTheme.colorScheme.surface
+            }
+        )
     ) {
         Row(
             modifier = Modifier
@@ -332,13 +443,34 @@ fun BookCard(book: Book, onClick: () -> Unit) {
                 .fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Icon(
-                Icons.Default.AutoStories,
-                contentDescription = null,
-                modifier = Modifier.size(40.dp),
-                tint = MaterialTheme.colorScheme.primary
-            )
+            // Icon based on status
+            when (book.status) {
+                BookStatus.CONVERTING, BookStatus.DOWNLOADING -> {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(40.dp),
+                        strokeWidth = 3.dp
+                    )
+                }
+                BookStatus.ERROR -> {
+                    Icon(
+                        Icons.Default.Error,
+                        contentDescription = null,
+                        modifier = Modifier.size(40.dp),
+                        tint = MaterialTheme.colorScheme.error
+                    )
+                }
+                else -> {
+                    Icon(
+                        Icons.Default.AutoStories,
+                        contentDescription = null,
+                        modifier = Modifier.size(40.dp),
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
+            
             Spacer(modifier = Modifier.width(16.dp))
+            
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text = book.title,
@@ -346,13 +478,28 @@ fun BookCard(book: Book, onClick: () -> Unit) {
                     fontWeight = FontWeight.SemiBold
                 )
                 Spacer(modifier = Modifier.height(4.dp))
+                
+                // Status text
+                val statusText = when (book.status) {
+                    BookStatus.CONVERTING -> "Converting..."
+                    BookStatus.DOWNLOADING -> "Downloading..."
+                    BookStatus.ERROR -> "Conversion failed"
+                    BookStatus.READY -> "${book.wordCount} words • ${book.duration.ifBlank { "N/A" }}"
+                }
+                
                 Text(
-                    text = "${book.wordCount} words • ${book.duration.ifBlank { "N/A" }}",
+                    text = statusText,
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    color = when (book.status) {
+                        BookStatus.ERROR -> MaterialTheme.colorScheme.error
+                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                    }
                 )
             }
-            Icon(Icons.Default.ChevronRight, contentDescription = "Open Book")
+            
+            if (isClickable) {
+                Icon(Icons.Default.ChevronRight, contentDescription = "Open Book")
+            }
         }
     }
 }
