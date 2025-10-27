@@ -500,6 +500,11 @@ def convert_text_to_audio():
         print(f"📖 Book: {book_title}")
         print(f"📊 Text length: {len(clean_text)} characters")
 
+        # Text length validation
+        MAX_TEXT_LENGTH = 500000
+        if len(clean_text) > MAX_TEXT_LENGTH:
+            return jsonify({"error": f"Text too long. Maximum {MAX_TEXT_LENGTH} characters."}), 400
+
         # Paths
         text_file = f"{WORK_DIR}/input.txt"
         audio_file = f"{WORK_DIR}/final_audio.wav"
