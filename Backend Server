@@ -1,0 +1,508 @@
+# TTS Conversion Server for Google Colab
+# Run this notebook with GPU enabled (Runtime > Change runtime type > T4 GPU)
+
+import os # Moved import os to the beginning
+import sys # Needed for sys.modules check
+import uuid # Import uuid for session IDs
+import tempfile # Import tempfile for caching
+import threading # Import threading for thread management (although session_lock removed, good practice if threads are used elsewhere)
+import traceback # Import traceback for error logging
+import random # Import random for simulation
+from flask import stream_with_context # Import stream_with_context
+import subprocess # Import subprocess for running Piper
+
+# ========================================
+# STEP 1: Install Dependencies
+# ========================================
+print("📦 Installing dependencies...")
+# Added requests for the new Step 5
+!pip install -q piper-tts flask flask-cors whisper-timestamped pyngrok requests
+
+# --- ADDED DEPENDENCY CHECK ---
+try:
+    import piper_tts
+    import flask
+    import flask_cors
+    import whisper_timestamped
+    import pyngrok
+    import requests
+    print("✅ Dependencies installed successfully.")
+except ImportError as e:
+    print(f"❌ Missing dependency: {e}")
+    print("Please check the pip installation step for errors.")
+    # Optionally, exit here if dependencies are critical
+    # import sys
+    # sys.exit("Dependency check failed.")
+# ------------------------------
+
+
+# ========================================
+# STEP 2: Setup Cloudflare Tunnel
+# ========================================
+print("\n🌐 Setting up Cloudflare Tunnel...")
+!wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+!dpkg -i cloudflared-linux-amd64.deb
+# Add a simple check for cloudflared executable
+if not os.path.exists("/usr/local/bin/cloudflared"):
+     print("❌ Cloudflare Tunnel executable not found. Please check the installation step.")
+     # Optionally, exit here
+     # import sys
+     # sys.exit("Cloudflare installation failed.")
+
+
+# ========================================
+# STEP 3: Download Piper Voice Model
+# ========================================
+print("\n🎤 Downloading Piper voice model (en_US-lessac-medium)...")
+os.makedirs("/content/piper_models", exist_ok=True)
+!wget -q -O /content/piper_models/en_US-lessac-medium.onnx \
+  https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx
+!wget -q -O /content/piper_models/en_US-lessac-medium.onnx.json \
+  https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json
+
+# --- ADDED MODEL CHECK ---
+PIPER_MODEL = "/content/piper_models/en_US-lessac-medium.onnx"
+PIPER_CONFIG = "/content/piper_models/en_US-lessac-medium.onnx.json"
+if os.path.exists(PIPER_MODEL) and os.path.exists(PIPER_CONFIG):
+    print("✅ Piper voice model downloaded successfully.")
+else:
+    print(f"❌ Piper voice model files not found. Expected: {PIPER_MODEL}, {PIPER_CONFIG}")
+    print("Please check the wget download step for errors.")
+    # Optionally, exit here
+    # import sys
+    # sys.exit("Piper model download failed.")
+# -------------------------
+
+
+# ========================================
+# STEP 4: Create Flask Server & Endpoints
+# ========================================
+from flask import Flask, request, send_file, jsonify, Response
+from flask_cors import CORS
+import subprocess
+import json
+import zipfile
+import whisper_timestamped as whisper
+import torch
+import threading
+import time
+import requests # <-- ADDED IMPORT
+import io
+
+app = Flask(__name__)
+CORS(app)
+
+WORK_DIR = "/content/conversion"
+os.makedirs(WORK_DIR, exist_ok=True)
+
+print("\n✅ Server initialized!")
+
+# Health check endpoint
+@app.route('/', methods=['GET'])
+def health_check():
+    # Also include checks for model/dependencies in health check
+    model_ok = os.path.exists(PIPER_MODEL) and os.path.exists(PIPER_CONFIG)
+    # Basic check for a few key libraries
+    deps_ok = all(pkg in sys.modules for pkg in ['piper_tts', 'flask', 'whisper_timestamped', 'requests'])
+
+    status_message = "TTS Conversion Server is running"
+    if not model_ok:
+        status_message += " - WARNING: Piper model files missing!"
+    if not deps_ok:
+         status_message += " - WARNING: Some dependencies missing!"
+
+
+    return jsonify({
+        "status": "online" if model_ok and deps_ok else "warning",
+        "message": status_message,
+        "gpu_available": torch.cuda.is_available(),
+        "piper_model_found": model_ok,
+        "dependencies_loaded": deps_ok
+    })
+
+# Main conversion endpoint
+@app.route('/convert', methods=['POST'])
+def convert_text_to_audio():
+    # Add check for model files existence at the start of endpoints that use them
+    if not os.path.exists(PIPER_MODEL) or not os.path.exists(PIPER_CONFIG):
+         return jsonify({"error": "Piper voice model files are missing on the server."}), 503 # Service Unavailable
+
+    try:
+        print("\n" + "="*50)
+        print("📝 NEW CONVERSION REQUEST RECEIVED")
+        print("="*50)
+
+        # Get clean text from request
+        data = request.get_json()
+        if not data or 'text' not in data:
+            return jsonify({"error": "No text provided"}), 400
+
+        clean_text = data['text']
+        book_title = data.get('title', 'book')
+
+        print(f"📖 Book: {book_title}")
+        print(f"📊 Text length: {len(clean_text)} characters")
+
+        # Paths
+        text_file = f"{WORK_DIR}/input.txt"
+        audio_file = f"{WORK_DIR}/final_audio.wav"
+        mp3_file = f"{WORK_DIR}/final_audio.mp3"
+        timestamps_file = f"{WORK_DIR}/timestamps.json"
+        zip_file = f"{WORK_DIR}/converted_book.zip"
+
+        # Clean up old files
+        for f in [text_file, audio_file, mp3_file, timestamps_file, zip_file]:
+            if os.path.exists(f):
+                os.remove(f)
+
+        # Save text to file
+        with open(text_file, 'w', encoding='utf-8') as f:
+            f.write(clean_text)
+
+        # =====================================
+        # STEP 1: Generate Audio with Piper TTS
+        # =====================================
+        print("\n🎵 Generating audio with Piper TTS...")
+        # Removed text=True to handle potential binary output correctly in case of errors
+        piper_cmd = f"piper --model {PIPER_MODEL} --output_file {audio_file} < {text_file}"
+        result = subprocess.run(piper_cmd, shell=True, capture_output=True) # Removed text=True
+
+        if result.returncode != 0:
+            # Decode stderr explicitly if needed for logging, but handle potential errors
+            try:
+                error_message = result.stderr.decode('utf-8', errors='replace')
+            except Exception:
+                error_message = "Undecodable Piper stderr output"
+            print(f"❌ Piper error: {error_message}")
+            return jsonify({"error": "TTS generation failed", "details": error_message}), 500
+
+        print(f"✅ Audio generated: {audio_file}")
+
+        # Convert WAV to MP3
+        print("🔄 Converting to MP3...")
+        subprocess.run(f"ffmpeg -i {audio_file} -codec:a libmp3lame -qscale:a 2 {mp3_file} -y",
+                       shell=True, capture_output=True)
+        print(f"✅ MP3 created: {mp3_file}")
+
+        # =====================================
+        # STEP 2: Generate Timestamps with Whisper
+        # =====================================
+        print("\n⏱️  Generating word-level timestamps with Whisper...")
+
+        # Load Whisper model
+        try:
+            # Check if whisper model files exist (whisper_timestamped downloads automatically, but good practice)
+            # This is harder to check precisely as whisper_timestamped manages models internally.
+            # Relying on the import check at the start and catching exceptions during use is more practical.
+            audio_whisper = whisper.load_audio(mp3_file)
+            model = whisper.load_model("base", device="cuda" if torch.cuda.is_available() else "cpu")
+
+            # Transcribe with word-level timestamps
+            result_whisper = whisper.transcribe(model, audio_whisper, language="en")
+
+            # Extract word-level timestamps
+            timestamps = []
+            for segment in result_whisper.get('segments', []):
+                for word_info in segment.get('words', []):
+                    timestamps.append({
+                        "word": word_info.get('text', '').strip(),
+                        "start": round(word_info.get('start', 0.0), 3),
+                        "end": round(word_info.get('end', 0.0), 3)
+                    })
+
+            # Save timestamps
+            with open(timestamps_file, 'w', encoding='utf-8') as f:
+                json.dump(timestamps, f, indent=2)
+
+            print(f"✅ Timestamps generated: {len(timestamps)} words")
+        except Exception as whisper_e:
+             print(f"⚠️  Whisper timestamp generation failed: {whisper_e}")
+             # Proceed without timestamps if Whisper fails
+             timestamps = []
+             if os.path.exists(timestamps_file):
+                 os.remove(timestamps_file)
+
+
+        # =====================================
+        # STEP 3: Package Everything
+        # =====================================
+        print("\n📦 Packaging files...")
+
+        # --- ADDED CHECK FOR MP3 FILE ---
+        if not os.path.exists(mp3_file):
+            error_msg = f"❌ Error: final_audio.mp3 was not created at {mp3_file}"
+            print(error_msg)
+            return jsonify({"error": "MP3 conversion failed or file missing", "details": error_msg}), 500
+        # -------------------------------
+
+        with zipfile.ZipFile(zip_file, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            zipf.write(mp3_file, 'final_audio.mp3')
+            if os.path.exists(timestamps_file): # Only add timestamps if they were generated
+                zipf.write(timestamps_file, 'timestamps.json')
+            # Also include original text for the app
+            zipf.write(text_file, 'book_text.txt')
+
+        print(f"✅ Package created: {zip_file}")
+        print("\n" + "="*50)
+        print("✨ CONVERSION COMPLETE!")
+        print("="*50)
+
+        # Send the zip file
+        return send_file(
+            zip_file,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name=f"{book_title.replace(' ', '_')}_converted.zip"
+        )
+
+    except Exception as e:
+        print(f"\n❌ ERROR: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+# =====================================
+# Real-Time Streaming Endpoint (Real TTS Audio)
+# =====================================
+
+CHUNK_DELIMITER = b"--CHUNK_BOUNDARY--"
+NEWLINE = b"\n"
+
+@app.route("/stream", methods=["POST"])
+def stream():
+    # Add check for model files existence at the start of endpoints that use them
+    if not os.path.exists(PIPER_MODEL) or not os.path.exists(PIPER_CONFIG):
+         return jsonify({"error": "Piper voice model files are missing on the server."}), 503 # Service Unavailable
+
+    try:
+        print("\n" + "=" * 50)
+        print("🎧 Starting real chunked live TTS stream")
+        print("=" * 50)
+        data = request.get_json(force=True)
+        text = data.get("text", "")
+        if not text.strip():
+            return jsonify({"error": "No text provided"}), 400
+
+        print(f"Text length: {len(text)} characters")
+
+        # === Chunk the text safely ===
+        def split_text_into_chunks(text, max_chars=1200):
+            import re
+            sentences = re.split(r'(?<=[.!?])\s+', text)
+            chunks, current = [], ""
+            for s in sentences:
+                if len(current) + len(s) > max_chars:
+                    chunks.append(current.strip())
+                    current = ""
+                current += s + " "
+            if current.strip():
+                chunks.append(current.strip())
+            return chunks
+
+        chunks = split_text_into_chunks(text)
+        print(f"🧩 Total chunks: {len(chunks)}")
+
+        # === Generator that streams audio from Piper sequentially ===
+        def generate():
+            # Assume standard Piper WAV output: 22050 Hz, 16-bit (2 bytes per sample), mono (1 channel)
+            sample_rate = 22050
+            bytes_per_sample = 2
+            num_channels = 1
+            bytes_per_second = sample_rate * bytes_per_sample * num_channels if sample_rate > 0 and bytes_per_sample > 0 else 0 # Avoid division by zero
+
+            cumulative_duration = 0.0 # Initialize cumulative duration
+
+            # Send init message
+            yield CHUNK_DELIMITER
+            yield NEWLINE # Add newline after delimiter
+            yield json.dumps({
+                "type": "init",
+                "session_id": str(uuid.uuid4()), # Generate a new session ID for each stream
+                "total_chunks": len(chunks),
+                "message": "Starting real TTS stream"
+            }).encode("utf-8")
+            yield NEWLINE
+            print("✅ Sent init message")
+
+
+            for i, chunk in enumerate(chunks, 1):
+                print(f"🔊 Generating chunk {i}/{len(chunks)} ({len(chunk)} chars)")
+                # Using communicate directly for smaller outputs or sufficient RAM
+                process = subprocess.Popen(
+                    ["piper", "--model", PIPER_MODEL, "--output_file", "-"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+
+                out, err = process.communicate(input=chunk.encode('utf-8'))
+                chunk_audio_data = out # Audio data is in stdout
+
+                if process.returncode != 0:
+                    try:
+                        error_message = err.decode('utf-8', errors='replace')
+                    except Exception:
+                        error_message = "Undecodable Piper stderr output during chunk"
+                    print(f"❌ Piper error during chunk {i}: {error_message}")
+                    # Optionally send an error message chunk to the client
+                    error_message_chunk = {
+                        "type": "error",
+                        "chunk_index": i,
+                        "message": f"TTS generation failed for chunk {i}: {error_message}"
+                    }
+                    yield CHUNK_DELIMITER
+                    yield NEWLINE
+                    yield json.dumps(error_message_chunk).encode('utf-8')
+                    yield NEWLINE
+                    continue # Skip this chunk and move to the next
+
+
+                # Calculate duration of the current audio chunk
+                current_chunk_duration = len(chunk_audio_data) / bytes_per_second if bytes_per_second > 0 else 0
+
+
+                # --- Prepare and yield timestamp message for this chunk ---
+                chunk_start_time = cumulative_duration # Start time of this chunk is the current cumulative duration
+                timestamp_message = {
+                    "type": "chunk_metadata",
+                    "chunk_index": i,
+                    "start_time": round(chunk_start_time, 3),
+                    "duration": round(current_chunk_duration, 3),
+                    "text": chunk, # Include the text chunk for reference
+                    "audio_size": len(chunk_audio_data) # Help client know how much audio to expect
+                }
+                # Convert dict to JSON string, then to bytes
+                timestamp_json_bytes = json.dumps(timestamp_message).encode('utf-8')
+
+                # Yield the delimiter, JSON message, and then the audio data
+                yield CHUNK_DELIMITER
+                yield NEWLINE # Add a newline after the delimiter for clarity
+                yield timestamp_json_bytes
+                yield NEWLINE # Add a newline after the JSON metadata
+                yield chunk_audio_data
+                # ----------------------------------------------------------
+
+
+                # Add current chunk duration to cumulative duration
+                cumulative_duration += current_chunk_duration
+
+
+                print(f"✅ Chunk {i} complete. Cumulative duration: {cumulative_duration:.3f}s")
+
+                time.sleep(0.1) # Small pause between chunks
+
+            # Optional: Yield a final delimiter or message to signal end of stream
+            end_message = {
+                "type": "end_of_stream",
+                "total_duration": round(cumulative_duration, 3),
+                "total_chunks": len(chunks)
+            }
+            yield CHUNK_DELIMITER
+            yield NEWLINE
+            yield json.dumps(end_message).encode('utf-8')
+            yield NEWLINE
+
+            print("🎉 All chunks streamed successfully.")
+
+        # Set the mimetype to indicate a mixed content stream, or a custom type
+        # Using a simple octet-stream requires the client to handle parsing
+        # A custom type like 'application/octet-stream; boundary=--CHUNK_BOUNDARY--' could be more explicit
+        # For simplicity here, we'll stick to octet-stream and rely on the client to find the delimiter
+        return Response(stream_with_context(generate()), mimetype="application/octet-stream")
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+# ========================================
+# STEP 5: Start Server and Tunnel (FIXED)
+# ========================================
+
+# Need sys for dependency check exits (if enabled)
+import sys
+
+def run_flask():
+    # Run Flask on port 5001
+    # use_reloader=False is important when running in a separate thread
+    app.run(host='0.0.0.0', port=5001, debug=False, use_reloader=False)
+
+def start_tunnel_and_get_url():
+    print("\n🌐 Starting Cloudflare Tunnel...")
+
+    # Check if cloudflared executable exists
+    if not os.path.exists("/usr/local/bin/cloudflared"):
+         print("❌ Cannot start tunnel: Cloudflare Tunnel executable not found.")
+         # Exit if cloudflared is essential
+         # sys.exit("Cloudflare executable missing.")
+         return # Exit function if not exiting script
+
+
+    # Use Popen to run cloudflared in the background
+    # We add --metrics localhost:4040 to create an endpoint to get the URL
+    tunnel_cmd = ["cloudflared", "tunnel", "--url", "http://localhost:5001", "--metrics", "localhost:4040"]
+    tunnel_process = subprocess.Popen(tunnel_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    print("⏳ Waiting for tunnel to initialize...")
+    time.sleep(5) # Give cloudflared a few seconds to start
+
+    # Try to get the public URL from the metrics endpoint
+    public_url = None
+    for i in range(5): # Retry 5 times
+        try:
+            response = requests.get("http://localhost:4040/quicktunnel")
+            response.raise_for_status() # Raise an exception for bad status codes
+            data = response.json()
+            public_url = data['hostname']
+            break # Success!
+        except Exception as e:
+            print(f"   ...retrying to get URL ({i+1}/5)")
+            time.sleep(2)
+
+    if public_url:
+        print("\n" + "="*50)
+        print("🎉 SERVER IS LIVE!")
+        print("="*50)
+        print(f"\n⚠️  IMPORTANT: Copy this public URL into your Android app:")
+        print(f"➡️   https://{public_url}")
+        print("="*50 + "\n")
+        print("This cell must stay running to keep the server online.")
+    else:
+        print("\n" + "="*50)
+        print("❌ FAILED TO START CLOUDFLARE TUNNEL")
+        print("="*50)
+        print("Please stop and re-run the cell.")
+        tunnel_process.kill() # Stop the broken tunnel process
+        return
+
+    # Keep the main thread alive by waiting for the tunnel process to end
+    # (which it won't, unless it crashes or is stopped)
+    try:
+        tunnel_process.wait()
+    except KeyboardInterrupt:
+        print("\n shutting down server...")
+        tunnel_process.kill()
+        print("✅ Server shut down.")
+
+# Kill any process running on port 5001
+print("🔪 Killing any process on port 5001...")
+# Use `command -v lsof` to check if lsof exists before using it
+lsof_exists = subprocess.run("command -v lsof", shell=True, capture_output=True).returncode == 0
+if lsof_exists:
+    !lsof -t -i:5001 | xargs -r kill -9 || true
+else:
+    print("⚠️  lsof command not found, could not check for processes on port 5001.")
+
+
+# Start Flask in background thread
+print("\n🚀 Starting Flask server...")
+# Check if flask_thread already exists and is alive, if so, try to join or just recreate
+# This is a bit hacky for a notebook; in a real app, you'd manage threads properly
+# For this context, we'll just assume we might need to recreate if the cell is run again.
+# We kill the old process on 5001 above, so recreating the thread should be okay.
+flask_thread = threading.Thread(target=run_flask, daemon=True)
+flask_thread.start()
+
+# Start the tunnel and keep the script alive
+start_tunnel_and_get_url()
