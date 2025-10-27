@@ -118,17 +118,33 @@ for model_name, path in voice_models:
 
 print(f"\n✅ Multi-speaker setup complete! Downloaded {downloaded_count} new voice models")
 
-# --- ADDED MODEL CHECK ---
+# --- EXPANDED MODEL CHECK ---
 PIPER_MODEL = "/content/piper_models/en_US-lessac-medium.onnx"
 PIPER_CONFIG = "/content/piper_models/en_US-lessac-medium.onnx.json"
-if os.path.exists(PIPER_MODEL) and os.path.exists(PIPER_CONFIG):
-    print("✅ Piper voice model downloaded successfully.")
+
+# Check all required models
+required_models = [
+    "en_US-lessac-medium",  # Narrator (existing)
+    "en_US-danny-medium",   # Male adult primary
+    "en_US-amy-medium",     # Female adult primary
+    "en_US-bryce-medium",   # Male young adult primary
+    "en_US-hfc_female-medium",  # Female young adult primary
+    "en_US-arctic-medium",  # Male elderly
+    "en_GB-aru-medium"      # Female elderly
+]
+
+missing_models = []
+for model in required_models:
+    model_path = f"/content/piper_models/{model}.onnx"
+    config_path = f"/content/piper_models/{model}.onnx.json"
+    if not (os.path.exists(model_path) and os.path.exists(config_path)):
+        missing_models.append(model)
+
+if not missing_models:
+    print("✅ All required voice models are available.")
 else:
-    print(f"❌ Piper voice model files not found. Expected: {PIPER_MODEL}, {PIPER_CONFIG}")
-    print("Please check the wget download step for errors.")
-    # Optionally, exit here
-    # import sys
-    # sys.exit("Piper model download failed.")
+    print(f"⚠️  Missing voice models: {', '.join(missing_models)}")
+    print("Multi-speaker features may be limited.")
 # -------------------------
 
 
