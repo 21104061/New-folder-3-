@@ -752,12 +752,19 @@ def convert_text_to_audio():
             return jsonify({"error": "MP3 conversion failed or file missing", "details": error_msg}), 500
         # -------------------------------
 
+        # Save speakers metadata
+        speakers_metadata_file = f"{WORK_DIR}/speakers_metadata.json"
+        with open(speakers_metadata_file, 'w', encoding='utf-8') as f:
+            json.dump(speakers_metadata_json, f, indent=2)
+
         with zipfile.ZipFile(zip_file, 'w', zipfile.ZIP_DEFLATED) as zipf:
             zipf.write(mp3_file, 'final_audio.mp3')
             if os.path.exists(timestamps_file): # Only add timestamps if they were generated
                 zipf.write(timestamps_file, 'timestamps.json')
             # Also include original text for the app
             zipf.write(text_file, 'book_text.txt')
+            # Include speakers metadata
+            zipf.write(speakers_metadata_file, 'speakers_metadata.json')
 
         print(f"✅ Package created: {zip_file}")
         print("\n" + "="*50)
