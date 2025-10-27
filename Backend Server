@@ -629,21 +629,71 @@ def convert_text_to_audio():
         # =====================================
         # PHASE 2: Generate Audio (Multi-Voice or Single-Voice)
         # =====================================
-        print("\n🎵 Generating audio with Piper TTS...")
-        # Removed text=True to handle potential binary output correctly in case of errors
-        piper_cmd = f"piper --model {PIPER_MODEL} --output_file {audio_file} < {text_file}"
-        result = subprocess.run(piper_cmd, shell=True, capture_output=True) # Removed text=True
 
-        if result.returncode != 0:
-            # Decode stderr explicitly if needed for logging, but handle potential errors
-            try:
-                error_message = result.stderr.decode('utf-8', errors='replace')
-            except Exception:
-                error_message = "Undecodable Piper stderr output"
-            print(f"❌ Piper error: {error_message}")
-            return jsonify({"error": "TTS generation failed", "details": error_message}), 500
+        if multi_speaker_mode:
+            print("\n🎵 Generating multi-voice audio...")
+            segment_audio_files = []
 
-        print(f"✅ Audio generated: {audio_file}")
+            # Generate audio for each segment
+            for i, segment in enumerate(segments):
+                speaker_id = segment['speaker_id']
+                segment_text = segment['text']
+
+                if not segment_text.strip():
+                    continue  # Skip empty segments
+
+                # Get voice model for this speaker
+                voice_model = speaker_metadata[speaker_id]['voice_model']
+                segment_audio_file = f"{WORK_DIR}/segment_{i:04d}.wav"
+
+                print(f"   Segment {i+1}/{len(segments)}: {speaker_metadata[speaker_id]['name']} ({len(segment_text)} chars)")
+
+                # Generate audio for this segment
+                success = generate_segment_audio(segment_text, voice_model, segment_audio_file)
+
+                if not success:
+                    # Try fallback to narrator voice
+                    print(f"   Retrying with narrator voice...")
+                    success = generate_segment_audio(segment_text, PIPER_MODEL, segment_audio_file)
+
+                    if not success:
+                        print(f"❌ Failed to generate audio for segment {i}")
+                        return jsonify({"error": f"TTS generation failed for segment {i}"}), 500
+
+                segment_audio_files.append(segment_audio_file)
+
+            # =====================================
+            # PHASE 3: Concatenate Audio Segments
+            # =====================================
+            print("\n🔗 Concatenating audio segments...")
+            success = concatenate_audio_segments(segment_audio_files, audio_file)
+
+            if not success:
+                print("❌ Audio concatenation failed")
+                return jsonify({"error": "Audio concatenation failed"}), 500
+
+            # Clean up segment files
+            for seg_file in segment_audio_files:
+                if os.path.exists(seg_file):
+                    os.remove(seg_file)
+
+            print(f"✅ Multi-voice audio generated: {audio_file}")
+
+        else:
+            # Single voice mode (original behavior)
+            print("\n🎵 Generating single-voice audio with Piper TTS...")
+            piper_cmd = f"piper --model {PIPER_MODEL} --output_file {audio_file} < {text_file}"
+            result = subprocess.run(piper_cmd, shell=True, capture_output=True)
+
+            if result.returncode != 0:
+                try:
+                    error_message = result.stderr.decode('utf-8', errors='replace')
+                except Exception:
+                    error_message = "Undecodable Piper stderr output"
+                print(f"❌ Piper error: {error_message}")
+                return jsonify({"error": "TTS generation failed", "details": error_message}), 500
+
+            print(f"✅ Audio generated: {audio_file}")
 
         # Convert WAV to MP3
         print("🔄 Converting to MP3...")
