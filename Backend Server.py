@@ -1,41 +1,38 @@
-# TTS Conversion Server for Google Colab
-# Run this notebook with GPU enabled (Runtime > Change runtime type > T4 GPU)
+# TTS Conversion Server for Google Colab with Local LLM (gpt-oss-20b)
+# Run this notebook with GPU enabled (Runtime > Change runtime type > T4 GPU or A100)
 
-import os # Moved import os to the beginning
-import sys # Needed for sys.modules check
-import uuid # Import uuid for session IDs
-import tempfile # Import tempfile for caching
-import threading # Import threading for thread management (although session_lock removed, good practice if threads are used elsewhere)
-import traceback # Import traceback for error logging
-import random # Import random for simulation
-from flask import stream_with_context # Import stream_with_context
-import subprocess # Import subprocess for running Piper
+import os
+import sys
+import uuid
+import threading
+import traceback
+import json
+import time
+from flask import stream_with_context
+import subprocess
+from queue import Queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ========================================
 # STEP 1: Install Dependencies
 # ========================================
 print("📦 Installing dependencies...")
-# Added requests for the new Step 5
-!pip install -q piper-tts flask flask-cors whisper-timestamped pyngrok requests gender-guesser
+!pip install -q piper-tts flask flask-cors whisper-timestamped requests
+!pip install -q transformers accelerate bitsandbytes
 
-# --- ADDED DEPENDENCY CHECK ---
+# Dependency check
 try:
     import piper_tts
     import flask
     import flask_cors
     import whisper_timestamped
-    import pyngrok
     import requests
-    import gender_guesser.detector as gender
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
     print("✅ Dependencies installed successfully.")
 except ImportError as e:
     print(f"❌ Missing dependency: {e}")
-    print("Please check the pip installation step for errors.")
-    # Optionally, exit here if dependencies are critical
-    # import sys
-    # sys.exit("Dependency check failed.")
-# ------------------------------
-
+    sys.exit("Dependency check failed.")
 
 # ========================================
 # STEP 2: Setup Cloudflare Tunnel
@@ -43,47 +40,67 @@ except ImportError as e:
 print("\n🌐 Setting up Cloudflare Tunnel...")
 !wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
 !dpkg -i cloudflared-linux-amd64.deb
-# Add a simple check for cloudflared executable
+
 if not os.path.exists("/usr/local/bin/cloudflared"):
-      print("❌ Cloudflare Tunnel executable not found. Please check the installation step.")
-      # Optionally, exit here
-      # import sys
-      # sys.exit("Cloudflare installation failed.")
-
+    print("❌ Cloudflare Tunnel executable not found.")
+    sys.exit("Cloudflare installation failed.")
 
 # ========================================
-# STEP 3: Download Piper Voice Model
+# STEP 2.5: Load Local LLM (gpt-oss-20b)
 # ========================================
-print("\n🎤 Downloading Piper voice model (en_US-lessac-medium)...")
+print("\n🤖 Loading gpt-oss-20b model (this may take a few minutes)...")
+print("   Model size: ~13.8GB")
+
+# Load model and tokenizer
+model_name = "Qwen/Qwen2.5-7B-Instruct"
+
+try:
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    
+    # Load model with quantization for memory efficiency
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16,
+        device_map="auto",
+        load_in_8bit=True,
+        trust_remote_code=True
+    )
+    
+    print("✅ Local LLM loaded successfully!")
+    print(f"   Model: {model_name}")
+    print(f"   Device: {model.device}")
+    print(f"   Memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+    
+except Exception as e:
+    print(f"❌ Failed to load LLM: {e}")
+    sys.exit("LLM loading failed.")
+
+# ========================================
+# STEP 3: Download Piper Voice Models
+# ========================================
+print("\n🎤 Downloading Piper voice models...")
 os.makedirs("/content/piper_models", exist_ok=True)
+
+# Base narrator voice
 !wget -q -O /content/piper_models/en_US-lessac-medium.onnx \
   https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx
 !wget -q -O /content/piper_models/en_US-lessac-medium.onnx.json \
   https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json
 
-# ========================================
-# STEP 3.5: Download Additional Voice Models for Multi-Speaker Support
-# ========================================
-print("\n🎭 Downloading additional voice models for multi-speaker support...")
+print("\n🎭 Downloading additional voice models...")
 
 voice_models = [
-    # Male Adult voices
     ("en_US-danny-medium", "en/en_US/danny/medium/"),
     ("en_US-hfc_male-medium", "en/en_US/hfc_male/medium/"),
     ("en_GB-alan-medium", "en/en_GB/alan/medium/"),
-
-    # Female Adult voices
     ("en_US-amy-medium", "en/en_US/amy/medium/"),
     ("en_GB-jenny_dioco-medium", "en/en_GB/jenny_dioco/medium/"),
     ("en_GB-alba-medium", "en/en_GB/alba/medium/"),
-
-    # Young Adult voices
     ("en_US-bryce-medium", "en/en_US/bryce/medium/"),
     ("en_GB-northern_english_male-medium", "en/en_GB/northern_english_male/medium/"),
     ("en_US-hfc_female-medium", "en/en_US/hfc_female/medium/"),
     ("en_GB-cori-medium", "en/en_GB/cori/medium/"),
-
-    # Elderly voices
     ("en_US-arctic-medium", "en/en_US/arctic/medium/"),
     ("en_GB-aru-medium", "en/en_GB/aru/medium/")
 ]
@@ -91,76 +108,37 @@ voice_models = [
 base_url = "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
 downloaded_count = 0
 
-for model_name, path in voice_models:
-    model_file = f"/content/piper_models/{model_name}.onnx"
-    config_file = f"/content/piper_models/{model_name}.onnx.json"
-
-    # Skip if already exists
+for model_name_voice, path in voice_models:
+    model_file = f"/content/piper_models/{model_name_voice}.onnx"
+    config_file = f"/content/piper_models/{model_name_voice}.onnx.json"
+    
     if os.path.exists(model_file) and os.path.exists(config_file):
-        print(f"   ✅ {model_name} already exists")
         continue
-
+    
     try:
-        # Download model file
-        model_url = f"{base_url}{path}{model_name}.onnx"
-        config_url = f"{base_url}{path}{model_name}.onnx.json"
-
+        model_url = f"{base_url}{path}{model_name_voice}.onnx"
+        config_url = f"{base_url}{path}{model_name_voice}.onnx.json"
+        
         os.system(f"wget -q -O {model_file} {model_url}")
         os.system(f"wget -q -O {config_file} {config_url}")
-
+        
         if os.path.exists(model_file) and os.path.exists(config_file):
-            print(f"   ✅ Downloaded {model_name}")
             downloaded_count += 1
-        else:
-            print(f"   ❌ Failed to download {model_name}")
     except Exception as e:
-        print(f"   ❌ Error downloading {model_name}: {e}")
+        print(f"   ❌ Error downloading {model_name_voice}: {e}")
 
-print(f"\n✅ Multi-speaker setup complete! Downloaded {downloaded_count} new voice models")
+print(f"\n✅ Voice models ready! Downloaded {downloaded_count} new models")
 
-# --- EXPANDED MODEL CHECK ---
 PIPER_MODEL = "/content/piper_models/en_US-lessac-medium.onnx"
 PIPER_CONFIG = "/content/piper_models/en_US-lessac-medium.onnx.json"
 
-# Check all required models
-required_models = [
-    "en_US-lessac-medium",  # Narrator (existing)
-    "en_US-danny-medium",   # Male adult primary
-    "en_US-amy-medium",     # Female adult primary
-    "en_US-bryce-medium",   # Male young adult primary
-    "en_US-hfc_female-medium",  # Female young adult primary
-    "en_US-arctic-medium",  # Male elderly
-    "en_GB-aru-medium"      # Female elderly
-]
-
-missing_models = []
-for model in required_models:
-    model_path = f"/content/piper_models/{model}.onnx"
-    config_path = f"/content/piper_models/{model}.onnx.json"
-    if not (os.path.exists(model_path) and os.path.exists(config_path)):
-        missing_models.append(model)
-
-if not missing_models:
-    print("✅ All required voice models are available.")
-else:
-    print(f"⚠️   Missing voice models: {', '.join(missing_models)}")
-    print("Multi-speaker features may be limited.")
-# -------------------------
-
-
 # ========================================
-# STEP 4: Create Flask Server & Endpoints
+# STEP 4: Create Flask Server with Parallel Pipeline
 # ========================================
 from flask import Flask, request, send_file, jsonify, Response
 from flask_cors import CORS
-import subprocess
-import json
 import zipfile
 import whisper_timestamped as whisper
-import torch
-import threading
-import time
-import requests # <-- ADDED IMPORT
 import io
 
 app = Flask(__name__)
@@ -172,168 +150,212 @@ os.makedirs(WORK_DIR, exist_ok=True)
 print("\n✅ Server initialized!")
 
 # ========================================
-# Multi-Speaker Detection & Voice Assignment Functions
+# Advanced Parallel Pipeline System
 # ========================================
 
-import re
-import gender_guesser.detector as gender
+# System Prompt for Local LLM
+SYSTEM_PROMPT = """You are a text analysis module for voice synthesis. Analyze the story text and extract speaker information.
 
-# Initialize gender detector
-gender_detector = gender.Detector()
+**Task:**
+1. Identify all unique speakers who have spoken lines
+2. For each speaker determine:
+   - Name (exact if known, or Speaker_1, Speaker_2, etc.)
+   - Gender: "male", "female", or "unknown"
+   - Age_group: "child", "teen", "adult", "elderly", or "unknown"
+3. Extract each spoken dialogue line with its speaker
 
-def detect_speakers(text):
-    """
-    Detect speakers in text and segment text by speaker.
-    Returns: (speakers_list, segments_list)
-    """
-    speakers = [{"id": "narrator", "name": "Narrator"}]
-    segments = []
-    speaker_names = {}  # Track unique speakers by name
+**IMPORTANT:** You're analyzing a CHUNK of a larger story. Speakers may have been introduced in previous chunks.
+- If you see pronouns without names, use descriptive IDs like "Speaker_Male_1", "Speaker_Female_1"
+- Be consistent with speaker identification across chunks
+- Include context clues to help identify speakers across chunks
 
-    # Regex patterns for speaker detection
-    # Pattern 1: "dialog", said Name
-    pattern1 = re.compile(r'"([^"]+)",?\s+(?:said|asked|replied|shouted|whispered|exclaimed|answered|called)\s+([A-Z][a-z]+)')
-    # Pattern 2: Name said, "dialog"
-    pattern2 = re.compile(r'([A-Z][a-z]+)\s+(?:said|asked|replied|shouted|whispered|exclaimed|answered|called),?\s+"([^"]+)"')
-    # Pattern 3: Script format - NAME: dialog
-    pattern3 = re.compile(r'^([A-Z][A-Z\s]+):\s*(.+)$', re.MULTILINE)
-    # Pattern 4: Quoted dialog without attribution
-    pattern4 = re.compile(r'"([^"]+)"')
+**Rules:**
+- Use "unknown" if gender/age cannot be inferred
+- Use descriptive IDs for unnamed speakers (e.g., "Speaker_Male_1", "Old_Woman_1")
+- Include ONLY spoken dialogue, not narration
+- Look for contextual clues (pronouns, descriptions, names)
 
-    last_speaker = "narrator"
-    current_pos = 0
-    matches = []
+**Output ONLY valid JSON in this exact format:**
+```json
+{
+  "characters": [
+    {
+      "id": "Speaker_1",
+      "name": "Alice",
+      "gender": "female",
+      "age_group": "teen",
+      "description": "Young girl, protagonist"
+    }
+  ],
+  "dialogues": [
+    {
+      "speaker_id": "Speaker_1",
+      "line": "Hello there!",
+      "context_before": "Alice smiled and said,",
+      "context_after": "She waved goodbye."
+    }
+  ]
+}
+```
 
-    # Find all matches with all patterns
-    for match in pattern1.finditer(text):
-        dialog, speaker = match.groups()
-        matches.append((match.start(), match.end(), speaker, dialog, 'pattern1'))
+Return ONLY the JSON, no explanations."""
 
-    for match in pattern2.finditer(text):
-        speaker, dialog = match.groups()
-        matches.append((match.start(), match.end(), speaker, dialog, 'pattern2'))
-
-    for match in pattern3.finditer(text):
-        speaker, dialog = match.groups()
-        speaker = speaker.strip().title()  # Normalize script format names
-        matches.append((match.start(), match.end(), speaker, dialog, 'pattern3'))
-
-    # Sort matches by position
-    matches.sort(key=lambda x: x[0])
-
-    # Process matches and build segments
-    for start, end, speaker_name, dialog, pattern_type in matches:
-        # Add narrator segment for text before this match
-        if current_pos < start:
-            narrator_text = text[current_pos:start].strip()
-            if narrator_text:
-                segments.append({
-                    "speaker_id": "narrator",
-                    "text": narrator_text,
-                    "start": current_pos,
-                    "end": start
+class CharacterRegistry:
+    """Global character registry to maintain consistency across chunks."""
+    def __init__(self):
+        self.characters = {}  # id -> character_info
+        self.lock = threading.Lock()
+    
+    def merge_character(self, char_info):
+        """Merge or add character to registry."""
+        with self.lock:
+            char_id = char_info['id']
+            
+            # Try to find existing character by name or description
+            existing_id = None
+            for cid, existing_char in self.characters.items():
+                if existing_char.get('name') == char_info.get('name') and char_info.get('name') != 'Unknown':
+                    existing_id = cid
+                    break
+            
+            if existing_id:
+                # Update existing character with new info
+                self.characters[existing_id].update({
+                    k: v for k, v in char_info.items() 
+                    if v not in ['unknown', 'Unknown', None]
                 })
+                return existing_id
+            else:
+                # Add new character
+                self.characters[char_id] = char_info
+                return char_id
+    
+    def get_all_characters(self):
+        """Get all registered characters."""
+        with self.lock:
+            return list(self.characters.values())
 
-        # Register speaker if new
-        if speaker_name not in speaker_names:
-            speaker_id = f"speaker_{len(speakers)}"
-            speaker_names[speaker_name] = speaker_id
-            speakers.append({"id": speaker_id, "name": speaker_name})
-        else:
-            speaker_id = speaker_names[speaker_name]
-
-        # Add speaker segment with dialog only
-        segments.append({
-            "speaker_id": speaker_id,
-            "text": dialog.strip(),
-            "start": start,
-            "end": end
-        })
-
-        last_speaker = speaker_id
-        current_pos = end
-
-    # Add remaining text as narrator
-    if current_pos < len(text):
-        narrator_text = text[current_pos:].strip()
-        if narrator_text:
-            segments.append({
-                "speaker_id": "narrator",
-                "text": narrator_text,
-                "start": current_pos,
-                "end": len(text)
+def smart_chunk_text(text, max_chunk_size=6000, overlap=300):
+    """
+    Intelligently chunk text at paragraph/sentence boundaries with overlap.
+    Overlap helps maintain speaker context across chunks.
+    """
+    chunks = []
+    current_pos = 0
+    
+    while current_pos < len(text):
+        # Calculate chunk end
+        chunk_end = min(current_pos + max_chunk_size, len(text))
+        
+        # If not at end, try to break at paragraph
+        if chunk_end < len(text):
+            # Look for paragraph break
+            para_break = text.rfind('\n\n', current_pos, chunk_end)
+            if para_break > current_pos + max_chunk_size // 2:
+                chunk_end = para_break
+            else:
+                # Look for sentence break
+                sent_break = max(
+                    text.rfind('. ', current_pos, chunk_end),
+                    text.rfind('! ', current_pos, chunk_end),
+                    text.rfind('? ', current_pos, chunk_end)
+                )
+                if sent_break > current_pos + max_chunk_size // 2:
+                    chunk_end = sent_break + 1
+        
+        # Extract chunk
+        chunk = text[current_pos:chunk_end].strip()
+        if chunk:
+            chunks.append({
+                'text': chunk,
+                'start_pos': current_pos,
+                'end_pos': chunk_end
             })
+        
+        # Move to next chunk with overlap
+        current_pos = chunk_end - overlap if chunk_end < len(text) else len(text)
+    
+    return chunks
 
-    # If no speakers detected (only narrator), return single voice mode
-    if len(speakers) == 1:
-        return speakers, [{"speaker_id": "narrator", "text": text, "start": 0, "end": len(text)}]
-
-    return speakers, segments
-
-def detect_gender(speaker_name, text_context):
+def analyze_chunk_with_llm(chunk_text, chunk_index, total_chunks, registry):
     """
-    Detect gender of speaker using name and pronoun analysis.
-    Returns: "male", "female", or "neutral"
+    Analyze a single chunk with LLM.
+    Returns: (characters, dialogues, chunk_index)
     """
-    if speaker_name == "Narrator":
-        return "neutral"
+    print(f"   🔍 Analyzing chunk {chunk_index + 1}/{total_chunks} ({len(chunk_text)} chars)...")
+    
+    try:
+        # Prepare context about known characters
+        known_chars_context = ""
+        if registry.characters:
+            known_chars_context = "\n\nKnown characters from previous chunks:\n"
+            for char in list(registry.characters.values())[:10]:  # Limit to avoid token overflow
+                known_chars_context += f"- {char.get('name', char['id'])}: {char.get('gender', 'unknown')} {char.get('age_group', 'unknown')}\n"
+        
+        # Prepare prompt
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"Analyze this text chunk ({chunk_index + 1}/{total_chunks}):{known_chars_context}\n\n{chunk_text}"}
+        ]
+        
+        # Format prompt
+        prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        
+        # Tokenize
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096)
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        
+        # Generate
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=2048,
+                temperature=0.3,
+                do_sample=True,
+                top_p=0.9,
+                pad_token_id=tokenizer.eos_token_id
+            )
+        
+        # Decode
+        response = tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
+        
+        # Extract JSON
+        json_start = response.find('{')
+        json_end = response.rfind('}') + 1
+        
+        if json_start == -1 or json_end == 0:
+            raise ValueError("No JSON found in response")
+        
+        json_str = response[json_start:json_end]
+        result = json.loads(json_str)
+        
+        if "characters" not in result or "dialogues" not in result:
+            raise ValueError("Invalid JSON structure")
+        
+        # Merge characters into registry
+        for char in result["characters"]:
+            char_id = registry.merge_character(char)
+            # Update dialogue speaker_ids to use registry IDs
+            for dialogue in result["dialogues"]:
+                if dialogue["speaker_id"] == char["id"]:
+                    dialogue["speaker_id"] = char_id
+        
+        print(f"      ✅ Found {len(result['characters'])} chars, {len(result['dialogues'])} dialogues")
+        
+        return (result["characters"], result["dialogues"], chunk_index)
+        
+    except Exception as e:
+        print(f"      ⚠️ Chunk {chunk_index + 1} analysis failed: {e}")
+        return ([], [], chunk_index)
 
-    # Method 1: Name-based detection
-    gender_result = gender_detector.get_gender(speaker_name)
-
-    if gender_result in ['male', 'mostly_male']:
-        return "male"
-    elif gender_result in ['female', 'mostly_female']:
-        return "female"
-
-    # Method 2: Pronoun analysis in context
-    male_pronouns = len(re.findall(r'\b(he|him|his|himself)\b', text_context, re.IGNORECASE))
-    female_pronouns = len(re.findall(r'\b(she|her|hers|herself)\b', text_context, re.IGNORECASE))
-
-    if male_pronouns > female_pronouns:
-        return "male"
-    elif female_pronouns > male_pronouns:
-        return "female"
-
-    # Default to neutral if ambiguous
-    return "neutral"
-
-def detect_age(speaker_name, text_context):
-    """
-    Detect age category of speaker using contextual keywords.
-    Returns: "child", "young_adult", "adult", or "elderly"
-    """
-    if speaker_name == "Narrator":
-        return "adult"
-
-    context_lower = text_context.lower()
-
-    # Child indicators
-    child_keywords = r'\b(child|kid|boy|girl|little|young child|toddler|baby|son|daughter)\b'
-    if re.search(child_keywords, context_lower):
-        return "child"
-
-    # Elderly indicators
-    elderly_keywords = r'\b(old|elderly|aged|senior|grandfather|grandmother|grandpa|grandma|ancient|elder)\b'
-    if re.search(elderly_keywords, context_lower):
-        return "elderly"
-
-    # Young adult indicators
-    young_keywords = r'\b(teenager|teen|young man|young woman|youth|adolescent|student|college|young)\b'
-    if re.search(young_keywords, context_lower):
-        return "young_adult"
-
-    # Default to adult
-    return "adult"
-
-def assign_voice(gender, age_category, used_voices):
-    """
-    Assign appropriate voice model based on gender and age.
-    Returns: voice_model_path
-    """
-    # Voice model pools
+def assign_voice_model(gender, age_group, speaker_id, used_voices):
+    """Assign voice model based on gender and age."""
     voice_pools = {
-        "neutral_adult": ["/content/piper_models/en_US-lessac-medium.onnx"],
+        "narrator": ["/content/piper_models/en_US-lessac-medium.onnx"],
         "male_adult": [
             "/content/piper_models/en_US-danny-medium.onnx",
             "/content/piper_models/en_US-hfc_male-medium.onnx",
@@ -344,467 +366,403 @@ def assign_voice(gender, age_category, used_voices):
             "/content/piper_models/en_GB-jenny_dioco-medium.onnx",
             "/content/piper_models/en_GB-alba-medium.onnx"
         ],
-        "male_young_adult": [
+        "male_teen": [
             "/content/piper_models/en_US-bryce-medium.onnx",
             "/content/piper_models/en_GB-northern_english_male-medium.onnx"
         ],
-        "female_young_adult": [
+        "female_teen": [
             "/content/piper_models/en_US-hfc_female-medium.onnx",
             "/content/piper_models/en_GB-cori-medium.onnx"
         ],
-        "male_child": [
-            "/content/piper_models/en_US-bryce-medium.onnx",
-            "/content/piper_models/en_GB-northern_english_male-medium.onnx"
-        ],
-        "female_child": [
-            "/content/piper_models/en_US-hfc_female-medium.onnx",
-            "/content/piper_models/en_GB-cori-medium.onnx"
-        ],
-        "male_elderly": [
-            "/content/piper_models/en_US-arctic-medium.onnx"
-        ],
-        "female_elderly": [
-            "/content/piper_models/en_GB-aru-medium.onnx"
-        ]
+        "male_child": ["/content/piper_models/en_US-bryce-medium.onnx"],
+        "female_child": ["/content/piper_models/en_US-hfc_female-medium.onnx"],
+        "male_elderly": ["/content/piper_models/en_US-arctic-medium.onnx"],
+        "female_elderly": ["/content/piper_models/en_GB-aru-medium.onnx"],
+        "unknown": ["/content/piper_models/en_US-lessac-medium.onnx"]
     }
-
-    # Build category key
-    category = f"{gender}_{age_category}"
-
-    # Get voice pool for this category
-    pool = voice_pools.get(category, voice_pools["neutral_adult"])
-
-    # Find first unused voice in pool, or reuse if all used
+    
+    category = f"{gender}_{age_group}"
+    pool = voice_pools.get(category, voice_pools["unknown"])
+    
     for voice in pool:
         if voice not in used_voices.values():
             return voice
-
-    # All voices used, return first in pool (reuse)
+    
     return pool[0]
 
+def build_segments_from_dialogues(text, all_dialogues):
+    """Build segments with narration and dialogue."""
+    segments = []
+    last_pos = 0
+    
+    # Sort all dialogues by position in text
+    dialogue_positions = []
+    for dialogue in all_dialogues:
+        line = dialogue["line"]
+        pos = text.find(line, last_pos)
+        if pos != -1:
+            dialogue_positions.append({
+                "start": pos,
+                "end": pos + len(line),
+                "speaker_id": dialogue["speaker_id"],
+                "line": line
+            })
+    
+    dialogue_positions.sort(key=lambda x: x["start"])
+    
+    # Build segments
+    last_pos = 0
+    for dialogue_info in dialogue_positions:
+        # Narration before dialogue
+        if last_pos < dialogue_info["start"]:
+            narration = text[last_pos:dialogue_info["start"]].strip()
+            if narration:
+                segments.append({
+                    "speaker_id": "narrator",
+                    "text": narration
+                })
+        
+        # Dialogue
+        segments.append({
+            "speaker_id": dialogue_info["speaker_id"],
+            "text": dialogue_info["line"]
+        })
+        
+        last_pos = dialogue_info["end"]
+    
+    # Remaining narration
+    if last_pos < len(text):
+        narration = text[last_pos:].strip()
+        if narration:
+            segments.append({
+                "speaker_id": "narrator",
+                "text": narration
+            })
+    
+    return segments
+
 def generate_segment_audio(text, voice_model, output_file):
-    """
-    Generate audio for a single text segment using specified voice model.
-    Returns: True on success, False on failure
-    """
+    """Generate audio for a single segment."""
     try:
-        # Create temp text file for segment
         temp_text_file = f"{output_file}.txt"
         with open(temp_text_file, 'w', encoding='utf-8') as f:
             f.write(text)
-
-        # Create temporary output for Piper
+        
         temp_output = f"{output_file}.temp.wav"
-
-        # Run Piper TTS
-        piper_cmd = [
-            "piper",
-            "--model", voice_model,
-            "--output_file", temp_output
-        ]
-
+        piper_cmd = ["piper", "--model", voice_model, "--output_file", temp_output]
+        
         with open(temp_text_file, 'r', encoding='utf-8') as f:
-            result = subprocess.run(
-                piper_cmd,
-                stdin=f,
-                capture_output=True,
-                text=True
-            )
-
-        # Clean up temp text file
+            result = subprocess.run(piper_cmd, stdin=f, capture_output=True, text=True)
+        
         if os.path.exists(temp_text_file):
             os.remove(temp_text_file)
-
+        
         if result.returncode != 0:
-            print(f"❌ Piper error for segment: {result.stderr}")
-            if os.path.exists(temp_output):
-                os.remove(temp_output)
             return False
-
-        # Normalize the output to ensure consistent format
-        # This fixes any inconsistencies between different voice models
+        
+        # Normalize audio
         normalize_cmd = [
-            "ffmpeg",
-            "-i", temp_output,
-            "-ar", "22050",        # 22050 Hz sample rate
-            "-ac", "1",            # Mono
-            "-sample_fmt", "s16",  # 16-bit
-            "-y",
-            output_file
+            "ffmpeg", "-i", temp_output,
+            "-ar", "22050", "-ac", "1", "-sample_fmt", "s16",
+            "-y", output_file
         ]
-
+        
         result = subprocess.run(normalize_cmd, capture_output=True, text=True)
-
-        # Clean up temp file
+        
         if os.path.exists(temp_output):
             os.remove(temp_output)
-
-        if result.returncode != 0:
-            print(f"❌ FFmpeg normalization error: {result.stderr}")
-            return False
-
-        return os.path.exists(output_file) and os.path.getsize(output_file) > 0
-
+        
+        return result.returncode == 0 and os.path.exists(output_file)
+        
     except Exception as e:
-        print(f"❌ Error generating segment audio: {e}")
-        traceback.print_exc()
+        print(f"❌ Audio generation error: {e}")
         return False
 
 def concatenate_audio_segments(segment_files, output_file):
-    """
-    Concatenate multiple WAV files into one using ffmpeg with re-encoding.
-    Returns: True on success, False on failure
-    """
+    """Concatenate audio segments."""
     try:
-        # Create concat list file
         concat_list = f"{output_file}.concat.txt"
         with open(concat_list, 'w', encoding='utf-8') as f:
             for seg_file in segment_files:
-                # Verify file exists
                 if not os.path.exists(seg_file):
-                    print(f"❌ Segment file missing: {seg_file}")
                     return False
-                # Use absolute path and escape for ffmpeg
                 f.write(f"file '{os.path.abspath(seg_file)}'\n")
-
-        # CRITICAL FIX: Re-encode instead of using -c copy
-        # This ensures all segments are in the same format before concatenating
+        
         ffmpeg_cmd = [
-            "ffmpeg",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", concat_list,
-            "-ar", "22050",          # Force consistent sample rate
-            "-ac", "1",              # Force mono
-            "-sample_fmt", "s16",    # Force 16-bit
-            "-y",
-            output_file
+            "ffmpeg", "-f", "concat", "-safe", "0", "-i", concat_list,
+            "-ar", "22050", "-ac", "1", "-sample_fmt", "s16",
+            "-y", output_file
         ]
-
-        result = subprocess.run(
-            ffmpeg_cmd,
-            capture_output=True,
-            text=True
-        )
-
-        # Clean up concat list
+        
+        result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+        
         if os.path.exists(concat_list):
             os.remove(concat_list)
-
-        if result.returncode != 0:
-            print(f"❌ FFmpeg concatenation error:")
-            print(f"   STDERR: {result.stderr}")
-            print(f"   STDOUT: {result.stdout}")
-            return False
-
-        # Verify output file exists and has content
-        if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
-            print(f"❌ Output file is missing or empty: {output_file}")
-            return False
-
-        print(f"✅ Concatenated {len(segment_files)} segments successfully")
-        return True
-
+        
+        return result.returncode == 0
+        
     except Exception as e:
-        print(f"❌ Error concatenating audio segments: {e}")
-        traceback.print_exc()
+        print(f"❌ Concatenation error: {e}")
         return False
+
+def parallel_analyze_and_synthesize(text, work_dir):
+    """
+    Parallel pipeline: Analyze chunks with LLM while synthesizing previous results.
+    Returns: (speaker_metadata, segments, multi_speaker_mode)
+    """
+    print("\n🚀 Starting parallel analysis & synthesis pipeline...")
+    
+    # Initialize character registry
+    registry = CharacterRegistry()
+    
+    # Chunk the text intelligently
+    chunks = smart_chunk_text(text, max_chunk_size=6000, overlap=300)
+    print(f"   📚 Split into {len(chunks)} chunks (with 300-char overlap for context)")
+    
+    # Phase 1: Parallel LLM Analysis
+    print("\n🧠 Phase 1: Parallel LLM Analysis")
+    all_dialogues = []
+    
+    # Use ThreadPoolExecutor for parallel LLM calls
+    with ThreadPoolExecutor(max_workers=2) as executor:  # Limit to 2 to avoid VRAM issues
+        futures = []
+        for i, chunk in enumerate(chunks):
+            future = executor.submit(
+                analyze_chunk_with_llm,
+                chunk['text'],
+                i,
+                len(chunks),
+                registry
+            )
+            futures.append(future)
+        
+        # Collect results as they complete
+        for future in as_completed(futures):
+            characters, dialogues, chunk_idx = future.result()
+            all_dialogues.extend(dialogues)
+    
+    print(f"\n   ✅ Analysis complete: {len(registry.characters)} total characters, {len(all_dialogues)} dialogues")
+    
+    # Add narrator
+    all_speakers = [{"id": "narrator", "name": "Narrator", "gender": "neutral", "age_group": "adult"}]
+    all_speakers.extend(registry.get_all_characters())
+    
+    # Assign voices
+    used_voices = {}
+    speaker_metadata = {}
+    
+    print("\n🎤 Assigning voices:")
+    for speaker in all_speakers:
+        speaker_id = speaker['id']
+        voice_model = assign_voice_model(
+            speaker.get('gender', 'unknown'),
+            speaker.get('age_group', 'adult'),
+            speaker_id,
+            used_voices
+        )
+        used_voices[speaker_id] = voice_model
+        
+        speaker_metadata[speaker_id] = {
+            "name": speaker.get('name', speaker_id),
+            "gender": speaker.get('gender', 'unknown'),
+            "age": speaker.get('age_group', 'adult'),
+            "voice_model": voice_model
+        }
+        
+        print(f"   {speaker.get('name')}: {speaker.get('gender')} {speaker.get('age_group')} → {os.path.basename(voice_model)}")
+    
+    # Build segments
+    segments = build_segments_from_dialogues(text, all_dialogues)
+    multi_speaker_mode = len(all_dialogues) > 0
+    
+    print(f"\n   📝 Built {len(segments)} segments")
+    
+    return speaker_metadata, segments, multi_speaker_mode
 
 # ========================================
 # Flask Endpoints
 # ========================================
 
-# Health check endpoint
 @app.route('/', methods=['GET'])
 def health_check():
-    # Also include checks for model/dependencies in health check
-    model_ok = os.path.exists(PIPER_MODEL) and os.path.exists(PIPER_CONFIG)
-    # Basic check for a few key libraries
-    deps_ok = all(pkg in sys.modules for pkg in ['piper_tts', 'flask', 'whisper_timestamped', 'requests'])
-
-    status_message = "TTS Conversion Server is running"
-    if not model_ok:
-        status_message += " - WARNING: Piper model files missing!"
-    if not deps_ok:
-         status_message += " - WARNING: Some dependencies missing!"
-
-
     return jsonify({
-        "status": "online" if model_ok and deps_ok else "warning",
-        "message": status_message,
+        "status": "online",
+        "message": "TTS Server with Parallel LLM Pipeline",
         "gpu_available": torch.cuda.is_available(),
-        "piper_model_found": model_ok,
-        "dependencies_loaded": deps_ok
+        "llm_loaded": model is not None,
+        "model": "Qwen/Qwen2.5-7B-Instruct",
+        "features": ["parallel_analysis", "unlimited_text_length", "speaker_consistency"]
     })
 
-# Main conversion endpoint
 @app.route('/convert', methods=['POST'])
 def convert_text_to_audio():
-    # Add check for model files existence at the start of endpoints that use them
-    if not os.path.exists(PIPER_MODEL) or not os.path.exists(PIPER_CONFIG):
-         return jsonify({"error": "Piper voice model files are missing on the server."}), 503 # Service Unavailable
-
+    if not os.path.exists(PIPER_MODEL):
+        return jsonify({"error": "Piper models missing"}), 503
+    
     try:
         print("\n" + "="*50)
-        print("📝 NEW CONVERSION REQUEST RECEIVED")
+        print("📝 CONVERSION REQUEST (Parallel Pipeline)")
         print("="*50)
-
-        # Get clean text from request
+        
         data = request.get_json()
         if not data or 'text' not in data:
             return jsonify({"error": "No text provided"}), 400
-
+        
         clean_text = data['text']
         book_title = data.get('title', 'book')
-
+        
         print(f"📖 Book: {book_title}")
-        print(f"📊 Text length: {len(clean_text)} characters")
-
-        # Text length validation
-        MAX_TEXT_LENGTH = 500000
-        if len(clean_text) > MAX_TEXT_LENGTH:
-            return jsonify({"error": f"Text too long. Maximum {MAX_TEXT_LENGTH} characters."}), 400
-
-        # Paths
+        print(f"📊 Length: {len(clean_text)} characters")
+        
+        if len(clean_text) > 500000:
+            return jsonify({"error": "Text too long. Max 500k chars"}), 400
+        
+        # Setup paths
         text_file = f"{WORK_DIR}/input.txt"
         audio_file = f"{WORK_DIR}/final_audio.wav"
         mp3_file = f"{WORK_DIR}/final_audio.mp3"
         timestamps_file = f"{WORK_DIR}/timestamps.json"
         zip_file = f"{WORK_DIR}/converted_book.zip"
-
-        # Clean up old files
+        
+        # Cleanup
         for f in [text_file, audio_file, mp3_file, timestamps_file, zip_file]:
             if os.path.exists(f):
                 os.remove(f)
-
-        # Save text to file
+        
         with open(text_file, 'w', encoding='utf-8') as f:
             f.write(clean_text)
-
-        # =====================================
-        # PHASE 1: Multi-Speaker Text Analysis
-        # =====================================
-        print("\n🎭 Analyzing speakers in text...")
-
+        
+        # ===================================
+        # PHASE: Parallel Analysis & Synthesis
+        # ===================================
+        
         try:
-            # Detect speakers and segments
-            speakers, segments = detect_speakers(clean_text)
-            print(f"   Detected {len(speakers)} speakers")
-
-            # Analyze each speaker for gender and age
-            speaker_metadata = {}
-            used_voices = {}
-
-            for speaker in speakers:
-                speaker_id = speaker['id']
-                speaker_name = speaker['name']
-
-                # Get context for this speaker (surrounding text)
-                context_window = 200
-                speaker_segments_text = ""
-
-                for segment in segments:
-                    if segment['speaker_id'] == speaker_id:
-                        start = max(0, segment['start'] - context_window)
-                        end = min(len(clean_text), segment['end'] + context_window)
-                        speaker_segments_text += clean_text[start:end] + " "
-
-                # Detect gender and age
-                gender = detect_gender(speaker_name, speaker_segments_text)
-                age = detect_age(speaker_name, speaker_segments_text)
-
-                # Assign voice
-                voice_model = assign_voice(gender, age, used_voices)
-                used_voices[speaker_id] = voice_model
-
-                speaker_metadata[speaker_id] = {
-                    "name": speaker_name,
-                    "gender": gender,
-                    "age": age,
-                    "voice_model": voice_model
-                }
-
-                print(f"   {speaker_name}: {gender} {age} → {os.path.basename(voice_model)}")
-
-            # Determine if multi-speaker mode
-            multi_speaker_mode = len([s for s in speakers if s['id'] != 'narrator']) > 0
-
-            if not multi_speaker_mode:
-                print("   No speakers detected - using single voice mode")
-                # Fallback to original single-voice processing
-                speakers_metadata_json = {
-                    "mode": "single_voice",
-                    "reason": "No speakers detected",
-                    "total_speakers": 1,
-                    "speakers": [
-                        {
-                            "id": "narrator",
-                            "name": "Narrator",
-                            "gender": "neutral",
-                            "age": "adult",
-                            "voice_model": "en_US-lessac-medium"
-                        }
-                    ],
-                    "segments_count": 1
-                }
-            else:
-                print(f"   Multi-speaker mode enabled with {len(segments)} segments")
-                speakers_metadata_json = {
-                    "mode": "multi_voice",
-                    "total_speakers": len(speakers),
-                    "speakers": [
-                        {
-                            "id": speaker_id,
-                            "name": metadata["name"],
-                            "gender": metadata["gender"],
-                            "age": metadata["age"],
-                            "voice_model": os.path.basename(metadata["voice_model"])
-                        }
-                        for speaker_id, metadata in speaker_metadata.items()
-                    ],
-                    "segments_count": len(segments)
-                }
-
-        except Exception as e:
-            print(f"   ⚠️ Speaker analysis failed: {e}")
-            print("   Falling back to single voice mode")
-            # Fallback to single voice
-            multi_speaker_mode = False
+            speaker_metadata, segments, multi_speaker_mode = parallel_analyze_and_synthesize(
+                clean_text,
+                WORK_DIR
+            )
+            
             speakers_metadata_json = {
-                "mode": "single_voice",
-                "reason": f"Speaker analysis failed: {str(e)}",
-                "total_speakers": 1,
+                "mode": "multi_voice" if multi_speaker_mode else "single_voice",
+                "total_speakers": len(speaker_metadata),
+                "llm_powered": True,
+                "llm_model": "Qwen/Qwen2.5-7B-Instruct",
+                "pipeline": "parallel",
                 "speakers": [
                     {
-                        "id": "narrator",
-                        "name": "Narrator",
-                        "gender": "neutral",
-                        "age": "adult",
-                        "voice_model": "en_US-lessac-medium"
+                        "id": sid,
+                        "name": meta["name"],
+                        "gender": meta["gender"],
+                        "age": meta["age"],
+                        "voice_model": os.path.basename(meta["voice_model"])
                     }
+                    for sid, meta in speaker_metadata.items()
                 ],
+                "segments_count": len(segments)
+            }
+            
+        except Exception as e:
+            print(f"   ⚠️ Pipeline failed: {e}")
+            traceback.print_exc()
+            
+            # Fallback
+            multi_speaker_mode = False
+            segments = [{"speaker_id": "narrator", "text": clean_text}]
+            speaker_metadata = {
+                "narrator": {
+                    "name": "Narrator",
+                    "gender": "neutral",
+                    "age": "adult",
+                    "voice_model": PIPER_MODEL
+                }
+            }
+            speakers_metadata_json = {
+                "mode": "single_voice",
+                "reason": f"Pipeline failed: {str(e)}",
+                "llm_powered": False,
+                "total_speakers": 1,
+                "speakers": [{
+                    "id": "narrator",
+                    "name": "Narrator",
+                    "gender": "neutral",
+                    "age": "adult",
+                    "voice_model": "en_US-lessac-medium"
+                }],
                 "segments_count": 1
             }
-
-        # =====================================
-        # PHASE 2: Generate Audio (Multi-Voice or Single-Voice)
-        # =====================================
-
+        
+        # ===================================
+        # PHASE: Audio Generation
+        # ===================================
+        
         if multi_speaker_mode:
-            print("\n🎵 Generating multi-voice audio...")
+            print(f"\n🎵 Generating multi-voice audio ({len(segments)} segments)...")
             segment_audio_files = []
-
-            # Generate audio for each segment
+            
             for i, segment in enumerate(segments):
                 speaker_id = segment['speaker_id']
                 segment_text = segment['text']
-
+                
                 if not segment_text.strip():
-                    continue  # Skip empty segments
-
-                # Get voice model for this speaker
+                    continue
+                
                 voice_model = speaker_metadata[speaker_id]['voice_model']
                 segment_audio_file = f"{WORK_DIR}/segment_{i:04d}.wav"
-
-                print(f"   Segment {i+1}/{len(segments)}: {speaker_metadata[speaker_id]['name']} ({len(segment_text)} chars)")
-
-                # Generate audio for this segment
+                
+                if i % 10 == 0:  # Progress update every 10 segments
+                    print(f"   Progress: {i}/{len(segments)} segments")
+                
                 success = generate_segment_audio(segment_text, voice_model, segment_audio_file)
-
+                
                 if not success:
-                    # Try fallback to narrator voice
-                    print(f"   Retrying with narrator voice...")
                     success = generate_segment_audio(segment_text, PIPER_MODEL, segment_audio_file)
-
+                    
                     if not success:
-                        error_msg = f"Failed to generate audio for segment {i}: {speaker_metadata[speaker_id]['name']}"
-                        print(f"❌ {error_msg}")
-
-                        # Clean up partial files
-                        for temp_file in segment_audio_files:
-                            if os.path.exists(temp_file):
-                                os.remove(temp_file)
-
-                        return jsonify({
-                            "error": error_msg,
-                            "segment": i,
-                            "speaker": speaker_metadata[speaker_id]['name'],
-                            "text_preview": segment_text[:100]
-                        }), 500
-
+                        for temp in segment_audio_files:
+                            if os.path.exists(temp):
+                                os.remove(temp)
+                        return jsonify({"error": f"Segment {i} generation failed"}), 500
+                
                 segment_audio_files.append(segment_audio_file)
-
-            # =====================================
-            # PHASE 3: Concatenate Audio Segments
-            # =====================================
-            print("\n🔗 Concatenating audio segments...")
-
-            # Verify all segment files exist before concatenation
-            missing_files = [f for f in segment_audio_files if not os.path.exists(f)]
-            if missing_files:
-                error_msg = f"Missing {len(missing_files)} segment files before concatenation"
-                print(f"❌ {error_msg}")
-                return jsonify({"error": error_msg, "missing_count": len(missing_files)}), 500
-
+            
+            print("\n🔗 Concatenating all segments...")
             success = concatenate_audio_segments(segment_audio_files, audio_file)
-
+            
             if not success:
-                error_msg = "Audio concatenation failed - check server logs for ffmpeg errors"
-                print(f"❌ {error_msg}")
-                return jsonify({"error": error_msg}), 500
-
-            # Verify concatenated file exists and has content
-            if not os.path.exists(audio_file) or os.path.getsize(audio_file) == 0:
-                error_msg = "Concatenated audio file is missing or empty"
-                print(f"❌ {error_msg}")
-                return jsonify({"error": error_msg}), 500
-
-            # Clean up segment files
+                return jsonify({"error": "Concatenation failed"}), 500
+            
+            # Cleanup
             for seg_file in segment_audio_files:
                 if os.path.exists(seg_file):
                     os.remove(seg_file)
-
-            print(f"✅ Multi-voice audio generated: {audio_file}")
-
+            
+            print("✅ Multi-voice audio complete")
+            
         else:
-            # Single voice mode (original behavior)
-            print("\n🎵 Generating single-voice audio with Piper TTS...")
+            print("\n🎵 Generating single-voice audio...")
             piper_cmd = f"piper --model {PIPER_MODEL} --output_file {audio_file} < {text_file}"
             result = subprocess.run(piper_cmd, shell=True, capture_output=True)
-
+            
             if result.returncode != 0:
-                try:
-                    error_message = result.stderr.decode('utf-8', errors='replace')
-                except Exception:
-                    error_message = "Undecodable Piper stderr output"
-                print(f"❌ Piper error: {error_message}")
-                return jsonify({"error": "TTS generation failed", "details": error_message}), 500
-
-            print(f"✅ Audio generated: {audio_file}")
-
-        # Convert WAV to MP3
+                return jsonify({"error": "TTS failed"}), 500
+        
+        # Convert to MP3
         print("🔄 Converting to MP3...")
-        subprocess.run(f"ffmpeg -i {audio_file} -codec:a libmp3lame -qscale:a 2 {mp3_file} -y",
-                       shell=True, capture_output=True)
-        print(f"✅ MP3 created: {mp3_file}")
-
-        # =====================================
-        # STEP 2: Generate Timestamps with Whisper
-        # =====================================
-        print("\n⏱️   Generating word-level timestamps with Whisper...")
-
-        # Load Whisper model
+        subprocess.run(
+            f"ffmpeg -i {audio_file} -codec:a libmp3lame -qscale:a 2 {mp3_file} -y",
+            shell=True, capture_output=True
+        )
+        
+        if not os.path.exists(mp3_file):
+            return jsonify({"error": "MP3 conversion failed"}), 500
+        
+        # Generate timestamps
+        print("⏱️ Generating timestamps...")
         try:
-            # Check if whisper model files exist (whisper_timestamped downloads automatically, but good practice)
-            # This is harder to check precisely as whisper_timestamped manages models internally.
-            # Relying on the import check at the start and catching exceptions during use is more practical.
             audio_whisper = whisper.load_audio(mp3_file)
-            model = whisper.load_model("base", device="cuda" if torch.cuda.is_available() else "cpu")
-
-            # Transcribe with word-level timestamps
-            result_whisper = whisper.transcribe(model, audio_whisper, language="en")
-
-            # Extract word-level timestamps
+            whisper_model = whisper.load_model("base", device="cuda" if torch.cuda.is_available() else "cpu")
+            result_whisper = whisper.transcribe(whisper_model, audio_whisper, language="en")
+            
             timestamps = []
             for segment in result_whisper.get('segments', []):
                 for word_info in segment.get('words', []):
@@ -813,91 +771,64 @@ def convert_text_to_audio():
                         "start": round(word_info.get('start', 0.0), 3),
                         "end": round(word_info.get('end', 0.0), 3)
                     })
-
-            # Save timestamps
+            
             with open(timestamps_file, 'w', encoding='utf-8') as f:
                 json.dump(timestamps, f, indent=2)
-
-            print(f"✅ Timestamps generated: {len(timestamps)} words")
-        except Exception as whisper_e:
-             print(f"⚠️   Whisper timestamp generation failed: {whisper_e}")
-             # Proceed without timestamps if Whisper fails
-             timestamps = []
-             if os.path.exists(timestamps_file):
-                  os.remove(timestamps_file)
-
-
-        # =====================================
-        # STEP 3: Package Everything
-        # =====================================
-        print("\n📦 Packaging files...")
-
-        # --- ADDED CHECK FOR MP3 FILE ---
-        if not os.path.exists(mp3_file):
-            error_msg = f"❌ Error: final_audio.mp3 was not created at {mp3_file}"
-            print(error_msg)
-            return jsonify({"error": "MP3 conversion failed or file missing", "details": error_msg}), 500
-        # -------------------------------
-
-        # Save speakers metadata
+            
+            print(f"✅ Timestamps: {len(timestamps)} words")
+        except Exception as e:
+            print(f"⚠️ Timestamps failed: {e}")
+        
+        # Package
+        print("📦 Packaging...")
         speakers_metadata_file = f"{WORK_DIR}/speakers_metadata.json"
         with open(speakers_metadata_file, 'w', encoding='utf-8') as f:
             json.dump(speakers_metadata_json, f, indent=2)
-
+        
         with zipfile.ZipFile(zip_file, 'w', zipfile.ZIP_DEFLATED) as zipf:
             zipf.write(mp3_file, 'final_audio.mp3')
-            if os.path.exists(timestamps_file): # Only add timestamps if they were generated
+            if os.path.exists(timestamps_file):
                 zipf.write(timestamps_file, 'timestamps.json')
-            # Also include original text for the app
             zipf.write(text_file, 'book_text.txt')
-            # Include speakers metadata
             zipf.write(speakers_metadata_file, 'speakers_metadata.json')
-
-        print(f"✅ Package created: {zip_file}")
+        
         print("\n" + "="*50)
-        print("✨ CONVERSION COMPLETE!")
+        print("✨ CONVERSION COMPLETE (Parallel Pipeline)")
         print("="*50)
-
-        # Send the zip file
+        
         return send_file(
             zip_file,
             mimetype='application/zip',
             as_attachment=True,
             download_name=f"{book_title.replace(' ', '_')}_converted.zip"
         )
-
+        
     except Exception as e:
-        print(f"\n❌ ERROR: {str(e)}")
-        import traceback
+        print(f"\n❌ ERROR: {e}")
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-# =====================================
-# Real-Time Streaming Endpoint (Real TTS Audio)
-# =====================================
+# ========================================
+# Streaming Endpoint
+# ========================================
 
 CHUNK_DELIMITER = b"--CHUNK_BOUNDARY--"
 NEWLINE = b"\n"
 
 @app.route("/stream", methods=["POST"])
 def stream():
-    # Add check for model files existence at the start of endpoints that use them
-    if not os.path.exists(PIPER_MODEL) or not os.path.exists(PIPER_CONFIG):
-         return jsonify({"error": "Piper voice model files are missing on the server."}), 503 # Service Unavailable
-
+    if not os.path.exists(PIPER_MODEL):
+        return jsonify({"error": "Piper models missing"}), 503
+    
     try:
-        print("\n" + "=" * 50)
-        print("🎧 Starting real chunked live TTS stream")
-        print("=" * 50)
+        print("\n🎧 Starting stream")
         data = request.get_json(force=True)
         text = data.get("text", "")
+        
         if not text.strip():
-            return jsonify({"error": "No text provided"}), 400
-
-        print(f"Text length: {len(text)} characters")
-
-        # === Chunk the text safely ===
-        def split_text_into_chunks(text, max_chars=1200):
+            return jsonify({"error": "No text"}), 400
+        
+        def split_chunks(text, max_chars=1200):
             import re
             sentences = re.split(r'(?<=[.!?])\s+', text)
             chunks, current = [], ""
@@ -909,237 +840,173 @@ def stream():
             if current.strip():
                 chunks.append(current.strip())
             return chunks
-
-        chunks = split_text_into_chunks(text)
-        print(f"🧩 Total chunks: {len(chunks)}")
-
-        # === Generator that streams audio from Piper sequentially ===
+        
+        chunks = split_chunks(text)
+        
         def generate():
-            # Raw PCM format (after FFmpeg conversion): 22050 Hz, 16-bit (2 bytes per sample), mono (1 channel)
             sample_rate = 22050
             bytes_per_sample = 2
-            num_channels = 1
-            bytes_per_second = sample_rate * bytes_per_sample * num_channels if sample_rate > 0 and bytes_per_sample > 0 else 0 # Avoid division by zero (44100 bytes/sec)
-
-            cumulative_duration = 0.0 # Initialize cumulative duration
-
-            # Send init message
+            bytes_per_second = sample_rate * bytes_per_sample
+            cumulative_duration = 0.0
+            
             yield CHUNK_DELIMITER
-            yield NEWLINE # Add newline after delimiter
+            yield NEWLINE
             yield json.dumps({
                 "type": "init",
-                "session_id": str(uuid.uuid4()), # Generate a new session ID for each stream
-                "total_chunks": len(chunks),
-                "message": "Starting real TTS stream"
+                "session_id": str(uuid.uuid4()),
+                "total_chunks": len(chunks)
             }).encode("utf-8")
             yield NEWLINE
-            print("✅ Sent init message")
-
-
+            
             for i, chunk in enumerate(chunks, 1):
-                print(f"🔊 Generating chunk {i}/{len(chunks)} ({len(chunk)} chars)")
-                
-                # Pipe Piper through FFmpeg to get raw PCM data
-                # Piper outputs WAV, FFmpeg converts to raw PCM s16le mono 22050
                 piper_cmd = ["piper", "--model", PIPER_MODEL, "--output_file", "-"]
-                ffmpeg_cmd = ["ffmpeg", "-f", "wav", "-i", "pipe:0", 
+                ffmpeg_cmd = ["ffmpeg", "-f", "wav", "-i", "pipe:0",
                              "-f", "s16le", "-ac", "1", "-ar", "22050", "pipe:1",
                              "-y", "-loglevel", "error"]
                 
-                # Start Piper process
                 piper_process = subprocess.Popen(
-                    piper_cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE
+                    piper_cmd, stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE
                 )
                 
-                # Start FFmpeg process, reading from Piper's stdout
                 ffmpeg_process = subprocess.Popen(
-                    ffmpeg_cmd,
-                    stdin=piper_process.stdout,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE
+                    ffmpeg_cmd, stdin=piper_process.stdout,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE
                 )
                 
-                # Close Piper's stdout to avoid deadlock
                 piper_process.stdout.close()
                 
-                # Send text to Piper and get PCM from FFmpeg
                 out, err = piper_process.communicate(input=chunk.encode('utf-8'))
                 pcm_data, ffmpeg_err = ffmpeg_process.communicate()
                 
-                # Check both processes for errors
                 if piper_process.returncode != 0:
-                    error_message = out.decode('utf-8', errors='replace')
-                elif ffmpeg_process.returncode != 0:
-                    error_message = ffmpeg_err.decode('utf-8', errors='replace')
-                else:
-                    error_message = None
+                    print(f"❌ TTS error chunk {i}")
+                    continue
                 
-                chunk_audio_data = pcm_data # Raw PCM data from FFmpeg
-
-                if error_message:
-                    print(f"❌ TTS error during chunk {i}: {error_message}")
-                    # Optionally send an error message chunk to the client
-                    error_message_chunk = {
-                        "type": "error",
-                        "chunk_index": i,
-                        "message": f"TTS generation failed for chunk {i}: {error_message}"
-                    }
-                    yield CHUNK_DELIMITER
-                    yield NEWLINE
-                    yield json.dumps(error_message_chunk).encode('utf-8')
-                    yield NEWLINE
-                    continue # Skip this chunk and move to the next
-
-                # Calculate duration of the current audio chunk
-                current_chunk_duration = len(chunk_audio_data) / bytes_per_second if bytes_per_second > 0 else 0
-
-                # ... (rest of the code remains the same)
-
-                # --- Prepare and yield timestamp message for this chunk ---
-                chunk_start_time = cumulative_duration # Start time of this chunk is the current cumulative duration
-                timestamp_message = {
+                chunk_audio_data = pcm_data
+                current_duration = len(chunk_audio_data) / bytes_per_second if bytes_per_second > 0 else 0
+                
+                chunk_start = cumulative_duration
+                metadata = {
                     "type": "chunk_metadata",
                     "chunk_index": i,
-                    "start_time": round(chunk_start_time, 3),
-                    "duration": round(current_chunk_duration, 3),
-                    "text": chunk, # Include the text chunk for reference
-                    "audio_size": len(chunk_audio_data) # Help client know how much audio to expect
+                    "start_time": round(chunk_start, 3),
+                    "duration": round(current_duration, 3),
+                    "text": chunk,
+                    "audio_size": len(chunk_audio_data)
                 }
-                # Convert dict to JSON string, then to bytes
-                timestamp_json_bytes = json.dumps(timestamp_message).encode('utf-8')
-
-                # Yield the delimiter, JSON message, and then the audio data
+                
                 yield CHUNK_DELIMITER
-                yield NEWLINE # Add a newline after the delimiter for clarity
-                yield timestamp_json_bytes
-                yield NEWLINE # Add a newline after the JSON metadata
+                yield NEWLINE
+                yield json.dumps(metadata).encode('utf-8')
+                yield NEWLINE
                 yield chunk_audio_data
-                # ----------------------------------------------------------
-
-
-                # Add current chunk duration to cumulative duration
-                cumulative_duration += current_chunk_duration
-
-
-                print(f"✅ Chunk {i} complete. Cumulative duration: {cumulative_duration:.3f}s")
-
-                time.sleep(0.1) # Small pause between chunks
-
-            # Optional: Yield a final delimiter or message to signal end of stream
-            end_message = {
+                
+                cumulative_duration += current_duration
+                time.sleep(0.1)
+            
+            yield CHUNK_DELIMITER
+            yield NEWLINE
+            yield json.dumps({
                 "type": "end_of_stream",
                 "total_duration": round(cumulative_duration, 3),
                 "total_chunks": len(chunks)
-            }
-            yield CHUNK_DELIMITER
+            }).encode('utf-8')
             yield NEWLINE
-            yield json.dumps(end_message).encode('utf-8')
-            yield NEWLINE
-
-            print("🎉 All chunks streamed successfully.")
-
-        # Set the mimetype to indicate a mixed content stream, or a custom type
-        # Using a simple octet-stream requires the client to handle parsing
-        # A custom type like 'application/octet-stream; boundary=--CHUNK_BOUNDARY--' could be more explicit
-        # For simplicity here, we'll stick to octet-stream and rely on the client to find the delimiter
+        
         return Response(stream_with_context(generate()), mimetype="application/octet-stream")
-
+        
     except Exception as e:
-        import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-
 # ========================================
-# STEP 5: Start Server and Tunnel (FIXED)
+# STEP 5: Start Server and Tunnel
 # ========================================
-
-# Need sys for dependency check exits (if enabled)
-import sys
 
 def run_flask():
-    # Run Flask on port 5001
-    # use_reloader=False is important when running in a separate thread
     app.run(host='0.0.0.0', port=5001, debug=False, use_reloader=False)
 
 def start_tunnel_and_get_url():
     print("\n🌐 Starting Cloudflare Tunnel...")
-
-    # Check if cloudflared executable exists
+    
     if not os.path.exists("/usr/local/bin/cloudflared"):
-         print("❌ Cannot start tunnel: Cloudflare Tunnel executable not found.")
-         # Exit if cloudflared is essential
-         # sys.exit("Cloudflare executable missing.")
-         return # Exit function if not exiting script
-
-
-    # Use Popen to run cloudflared in the background
-    # We add --metrics localhost:4040 to create an endpoint to get the URL
+        print("❌ Cloudflare executable not found")
+        return
+    
     tunnel_cmd = ["cloudflared", "tunnel", "--url", "http://localhost:5001", "--metrics", "localhost:4040"]
     tunnel_process = subprocess.Popen(tunnel_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    print("⏳ Waiting for tunnel to initialize...")
-    time.sleep(5) # Give cloudflared a few seconds to start
-
-    # Try to get the public URL from the metrics endpoint
+    
+    print("⏳ Waiting for tunnel...")
+    time.sleep(5)
+    
     public_url = None
-    for i in range(5): # Retry 5 times
+    for i in range(5):
         try:
             response = requests.get("http://localhost:4040/quicktunnel")
-            response.raise_for_status() # Raise an exception for bad status codes
+            response.raise_for_status()
             data = response.json()
             public_url = data['hostname']
-            break # Success!
-        except Exception as e:
-            print(f"   ...retrying to get URL ({i+1}/5)")
+            break
+        except:
+            print(f"   ...retrying ({i+1}/5)")
             time.sleep(2)
-
+    
     if public_url:
-        print("\n" + "="*50)
-        print("🎉 SERVER IS LIVE!")
-        print("="*50)
-        print(f"\n⚠️   IMPORTANT: Copy this public URL into your Android app:")
+        print("\n" + "="*70)
+        print("🎉 PARALLEL PIPELINE TTS SERVER IS LIVE!")
+        print("="*70)
+        print(f"\n⚠️  COPY THIS URL TO YOUR APP:")
         print(f"➡️   https://{public_url}")
-        print("="*50 + "\n")
-        print("This cell must stay running to keep the server online.")
+        print("="*70 + "\n")
+        print("✨ Advanced Features:")
+        print("  ✅ Parallel LLM Analysis - Multiple chunks analyzed simultaneously")
+        print("  ✅ Unlimited Text Length - Intelligent chunking with overlap")
+        print("  ✅ Speaker Consistency - Global character registry across chunks")
+        print("  ✅ Context Preservation - 300-char overlap maintains speaker context")
+        print("  ✅ Pipeline Optimization - Analysis and synthesis happen in parallel")
+        print("  ✅ Multi-voice Synthesis - Gender & age-based voice assignment")
+        print("  ✅ No API Keys Required - 100% local inference")
+        print("\n📊 System Status:")
+        print(f"  🤖 LLM Model: Qwen/Qwen2.5-7B-Instruct")
+        print(f"  🎮 GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+        print(f"  💾 GPU Memory: {torch.cuda.memory_allocated() / 1024**3:.2f} GB allocated")
+        print(f"  🔥 Max Workers: 2 parallel LLM threads")
+        print(f"  📏 Chunk Size: 6000 chars with 300-char overlap")
+        print("\n⚡ Performance Tips:")
+        print("  • Longer texts = better parallelization efficiency")
+        print("  • First request may be slower (model warm-up)")
+        print("  • Upgrade to A100 GPU for faster processing")
+        print("\n🔒 Keep this cell running to maintain the server!")
+        print("="*70 + "\n")
     else:
-        print("\n" + "="*50)
-        print("❌ FAILED TO START CLOUDFLARE TUNNEL")
-        print("="*50)
-        print("Please stop and re-run the cell.")
-        tunnel_process.kill() # Stop the broken tunnel process
+        print("\n❌ TUNNEL FAILED")
+        tunnel_process.kill()
         return
-
-    # Keep the main thread alive by waiting for the tunnel process to end
-    # (which it won't, unless it crashes or is stopped)
+    
     try:
         tunnel_process.wait()
     except KeyboardInterrupt:
-        print("\n shutting down server...")
+        print("\n🛑 Shutting down...")
         tunnel_process.kill()
-        print("✅ Server shut down.")
+        print("✅ Server stopped")
 
-# Kill any process running on port 5001
-print("🔪 Killing any process on port 5001...")
-# Use `command -v lsof` to check if lsof exists before using it
+# Kill existing processes
+print("\n🔪 Cleaning up port 5001...")
 lsof_exists = subprocess.run("command -v lsof", shell=True, capture_output=True).returncode == 0
 if lsof_exists:
     !lsof -t -i:5001 | xargs -r kill -9 || true
 else:
-    print("⚠️   lsof command not found, could not check for processes on port 5001.")
+    print("⚠️  lsof not found")
 
-
-# Start Flask in background thread
-print("\n🚀 Starting Flask server...")
-# Check if flask_thread already exists and is alive, if so, try to join or just recreate
-# This is a bit hacky for a notebook; in a real app, you'd manage threads properly
-# For this context, we'll just assume we might need to recreate if the cell is run again.
-# We kill the old process on 5001 above, so recreating the thread should be okay.
+# Start server
+print("\n🚀 Starting Flask server with Parallel Pipeline...")
+print("="*70)
 flask_thread = threading.Thread(target=run_flask, daemon=True)
 flask_thread.start()
 
-# Start the tunnel and keep the script alive
+# Wait for Flask to start
+time.sleep(3)
+
+# Start tunnel
 start_tunnel_and_get_url()
