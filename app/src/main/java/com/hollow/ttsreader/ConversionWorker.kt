@@ -6,12 +6,14 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.work.CoroutineWorker
 import androidx.work.ForegroundInfo
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -30,74 +32,229 @@ class ConversionWorker(
     companion object {
         const val KEY_BOOK_ID = "book_id"
         const val KEY_BOOK_TITLE = "book_title"
-        const val KEY_BOOK_TEXT = "book_text"
         const val KEY_SERVER_URL = "server_url"
         const val KEY_WORD_COUNT = "word_count"
-        
+
         const val CHANNEL_ID = "book_conversion_channel"
         const val NOTIFICATION_ID = 1001
+
+        private const val TAG = "ConversionWorker"
     }
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
-        val bookId = inputData.getString(KEY_BOOK_ID) ?: return@withContext Result.failure()
-        val title = inputData.getString(KEY_BOOK_TITLE) ?: return@withContext Result.failure()
-        val text = inputData.getString(KEY_BOOK_TEXT) ?: return@withContext Result.failure()
-        val serverUrl = inputData.getString(KEY_SERVER_URL) ?: return@withContext Result.failure()
-        val wordCount = inputData.getInt(KEY_WORD_COUNT, 0)
+        val bookId = inputData.getString(KEY_BOOK_ID) ?: run {
+            Log.e(TAG, "Missing book ID")
+            return@withContext Result.failure(workDataOf("error" to "Missing book ID"))
+        }
 
+        val title = inputData.getString(KEY_BOOK_TITLE) ?: run {
+            Log.e(TAG, "Missing book title")
+            return@withContext Result.failure(workDataOf("error" to "Missing title"))
+        }
+
+        // Read text from the saved file instead of input data (to avoid 10KB WorkManager limit)
         val bookManager = BookManager(applicationContext)
+        val book = bookManager.getBook(bookId) ?: run {
+            Log.e(TAG, "Book not found: $bookId")
+            return@withContext Result.failure(workDataOf("error" to "Book not found"))
+        }
+        
+        val text = try {
+            File(book.textPath).readText()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to read book text: ${e.message}")
+            return@withContext Result.failure(workDataOf("error" to "Failed to read book text"))
+        }
+
+        val serverUrl = inputData.getString(KEY_SERVER_URL) ?: run {
+            Log.e(TAG, "Missing server URL")
+            return@withContext Result.failure(workDataOf("error" to "Missing server URL"))
+        }
+
+        val wordCount = inputData.getInt(KEY_WORD_COUNT, 0)
 
         try {
             createNotificationChannel()
             setForeground(createForegroundInfo(title, "Starting conversion..."))
 
+            Log.d(TAG, "Starting conversion for book: $title (ID: $bookId)")
+
             // Update status to CONVERTING
             bookManager.updateBookStatus(bookId, BookStatus.CONVERTING)
 
             // Start conversion
-            setForeground(createForegroundInfo(title, "Converting to audio..."))
+            setForeground(createForegroundInfo(title, "Sending to server..."))
 
-            ServerAPI.convertBookRaw(
+            Log.d(TAG, "Starting async conversion with serverUrl: $serverUrl")
+
+            // Start async conversion
+            val jobResponse = ServerAPI.startAsyncConversion(
                 title = title,
                 text = text,
                 serverUrl = serverUrl
-            ).use { response ->
-                if (!response.isSuccessful) {
-                    val errorBody = response.body?.string() ?: "Unknown error"
-                    bookManager.updateBookStatus(bookId, BookStatus.ERROR)
-                    
-                    showErrorNotification(title, "Conversion failed: $errorBody")
-                    return@withContext Result.failure(
-                        workDataOf("error" to errorBody)
-                    )
-                }
+            )
 
-                // Update status to DOWNLOADING
-                bookManager.updateBookStatus(bookId, BookStatus.DOWNLOADING)
-                setForeground(createForegroundInfo(title, "Downloading..."))
+            Log.d(TAG, "Async job started: ${jobResponse.job_id}")
 
-                // Save the ZIP file
-                val bookDir = bookManager.createBookDirectory(bookId)
-                val zipFile = File(bookDir, "download.zip")
+            // Update book with job ID
+            val currentBooks = bookManager.getBooks().toMutableList()
+            val bookIndex = currentBooks.indexOfFirst { it.id == bookId }
+            if (bookIndex != -1) {
+                currentBooks[bookIndex] = currentBooks[bookIndex].copy(jobId = jobResponse.job_id)
+                val metadataFile = File(applicationContext.filesDir, "books_metadata.json")
+                val jsonString = Json.encodeToString(currentBooks)
+                metadataFile.writeText(jsonString)
+            }
+
+            // Poll for completion
+            setForeground(createForegroundInfo(title, "Waiting for server processing..."))
+            
+            var attempts = 0
+            val maxAttempts = 360 // 3 hours with 30-second intervals
+            
+            // Get initial status
+            var jobStatus = try {
+                ServerAPI.getJobStatus(jobResponse.job_id, serverUrl)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to get initial job status: ${e.message}")
+                bookManager.updateBookStatus(bookId, BookStatus.ERROR)
+                showErrorNotification(title, "Failed to start conversion")
+                return@withContext Result.failure(workDataOf("error" to "Failed to start conversion"))
+            }
+            
+            while (jobStatus.status in listOf("queued", "processing") && attempts < maxAttempts) {
+                delay(30000) // Wait 30 seconds between polls
+                attempts++
                 
-                response.body?.byteStream()?.use { input ->
-                    FileOutputStream(zipFile).use { output ->
-                        input.copyTo(output)
+                try {
+                    jobStatus = ServerAPI.getJobStatus(jobResponse.job_id, serverUrl)
+                    Log.d(TAG, "Job status: ${jobStatus.status}, progress: ${jobStatus.progress}")
+                    
+                    // Update notification with progress
+                    val progressText = jobStatus.progress ?: jobStatus.status
+                    setForeground(createForegroundInfo(title, progressText))
+                    
+                    when (jobStatus.status) {
+                        "completed" -> break
+                        "failed" -> {
+                            val error = jobStatus.error ?: "Unknown error"
+                            Log.e(TAG, "Job failed: $error")
+                            bookManager.updateBookStatus(bookId, BookStatus.ERROR)
+                            showErrorNotification(title, "Conversion failed: $error")
+                            return@withContext Result.failure(workDataOf("error" to error))
+                        }
+                    }
+                    
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to get job status (attempt $attempts): ${e.message}")
+                    if (attempts >= maxAttempts) {
+                        Log.e(TAG, "Max polling attempts reached")
+                        bookManager.updateBookStatus(bookId, BookStatus.ERROR)
+                        showErrorNotification(title, "Conversion timeout after 3 hours")
+                        return@withContext Result.failure(workDataOf("error" to "Timeout"))
                     }
                 }
+                
+            }
 
-                // Extract files
-                setForeground(createForegroundInfo(title, "Extracting files..."))
+            if (attempts >= maxAttempts) {
+                Log.e(TAG, "Conversion timed out")
+                bookManager.updateBookStatus(bookId, BookStatus.ERROR)
+                showErrorNotification(title, "Conversion timeout")
+                return@withContext Result.failure(workDataOf("error" to "Timeout"))
+            }
 
-                var audioPath = ""
-                var timestampsPath = ""
-                var textPath = ""
-                var audioFileSize = 0L
+            // Download completed file
+            setForeground(createForegroundInfo(title, "Downloading completed file..."))
+            
+            val response = ServerAPI.downloadCompletedJob(jobResponse.job_id, serverUrl)
+            
+            Log.d(TAG, "Download response code: ${response.code}")
 
+            if (!response.isSuccessful) {
+                val errorBody = response.body?.string() ?: "Unknown error (empty response)"
+                Log.e(TAG, "Download failed: ${response.code} - $errorBody")
+
+                bookManager.updateBookStatus(bookId, BookStatus.ERROR)
+                showErrorNotification(title, "Download failed: ${response.code} - $errorBody")
+
+                return@withContext Result.failure(
+                    workDataOf("error" to "Download failed: ${response.code} - $errorBody")
+                )
+            }
+
+            // Check if response has a body
+            val responseBody = response.body
+            if (responseBody == null) {
+                Log.e(TAG, "Response body is null")
+                bookManager.updateBookStatus(bookId, BookStatus.ERROR)
+                showErrorNotification(title, "Empty response from server")
+                return@withContext Result.failure(
+                    workDataOf("error" to "Empty response from server")
+                )
+            }
+
+            // Update status to DOWNLOADING
+            bookManager.updateBookStatus(bookId, BookStatus.DOWNLOADING)
+            setForeground(createForegroundInfo(title, "Downloading converted file..."))
+
+            // Save the ZIP file
+            val bookDir = bookManager.createBookDirectory(bookId)
+            val zipFile = File(bookDir, "download.zip")
+
+            Log.d(TAG, "Saving ZIP to: ${zipFile.absolutePath}")
+
+            var bytesDownloaded = 0L
+            responseBody.byteStream().use { input ->
+                FileOutputStream(zipFile).use { output ->
+                    val buffer = ByteArray(8192)
+                    var bytes = input.read(buffer)
+                    while (bytes >= 0) {
+                        output.write(buffer, 0, bytes)
+                        bytesDownloaded += bytes
+
+                        // Update notification every 100KB
+                        if (bytesDownloaded % 102400 == 0L) {
+                            setForeground(createForegroundInfo(
+                                title,
+                                "Downloaded ${bytesDownloaded / 1024}KB..."
+                            ))
+                        }
+
+                        bytes = input.read(buffer)
+                    }
+                }
+            }
+
+            Log.d(TAG, "Download complete: $bytesDownloaded bytes")
+
+            if (!zipFile.exists() || zipFile.length() == 0L) {
+                Log.e(TAG, "ZIP file is empty or doesn't exist")
+                bookManager.updateBookStatus(bookId, BookStatus.ERROR)
+                showErrorNotification(title, "Downloaded file is empty")
+                return@withContext Result.failure(
+                    workDataOf("error" to "Downloaded file is empty")
+                )
+            }
+
+            // Extract files
+            setForeground(createForegroundInfo(title, "Extracting files..."))
+            Log.d(TAG, "Extracting ZIP file...")
+
+            var audioPath = ""
+            var timestampsPath = ""
+            var textPath = ""
+            var speakersMetadataPath = ""
+
+            try {
                 ZipInputStream(zipFile.inputStream()).use { zipInput ->
                     var entry = zipInput.nextEntry
+                    var entryCount = 0
+
                     while (entry != null) {
+                        entryCount++
                         val file = File(bookDir, entry.name)
+                        Log.d(TAG, "Extracting: ${entry.name} (${entry.size} bytes)")
 
                         if (!entry.isDirectory) {
                             FileOutputStream(file).use { output ->
@@ -105,75 +262,96 @@ class ConversionWorker(
                             }
 
                             when (entry.name) {
-                                "final_audio.mp3" -> {
-                                    audioPath = file.absolutePath
-                                    audioFileSize = file.length()
-                                }
+                                "final_audio.mp3" -> audioPath = file.absolutePath
                                 "timestamps.json" -> timestampsPath = file.absolutePath
                                 "book_text.txt" -> textPath = file.absolutePath
+                                "speakers_metadata.json" -> speakersMetadataPath = file.absolutePath
                             }
                         }
 
                         zipInput.closeEntry()
                         entry = zipInput.nextEntry
                     }
+
+                    Log.d(TAG, "Extracted $entryCount entries from ZIP")
                 }
-
-                // Delete zip file
-                zipFile.delete()
-
-                if (audioPath.isEmpty() || textPath.isEmpty()) {
-                    bookManager.updateBookStatus(bookId, BookStatus.ERROR)
-                    showErrorNotification(title, "Downloaded file is incomplete")
-                    return@withContext Result.failure(
-                        workDataOf("error" to "Incomplete download")
-                    )
-                }
-
-                // Get audio duration
-                val timestamps = if (File(timestampsPath).exists()) {
-                    val json = File(timestampsPath).readText()
-                    Json.decodeFromString<List<WordTimestamp>>(json)
-                } else {
-                    emptyList()
-                }
-                
-                val durationSeconds = timestamps.lastOrNull()?.end?.toInt() ?: 0
-                val durationFormatted = formatDuration(durationSeconds)
-
-                // Create final Book object with READY status
-                val finalBook = Book(
-                    id = bookId,
-                    title = title,
-                    audioPath = audioPath,
-                    timestampsPath = timestampsPath,
-                    textPath = textPath,
-                    wordCount = wordCount,
-                    duration = durationFormatted,
-                    status = BookStatus.READY,
-                    fileSize = audioFileSize
+            } catch (e: Exception) {
+                Log.e(TAG, "Error extracting ZIP: ${e.message}", e)
+                bookManager.updateBookStatus(bookId, BookStatus.ERROR)
+                showErrorNotification(title, "Failed to extract files: ${e.message}")
+                return@withContext Result.failure(
+                    workDataOf("error" to "Extraction failed: ${e.message}")
                 )
-
-                // Update book in metadata
-                val currentBooks = bookManager.getBooks().toMutableList()
-                val index = currentBooks.indexOfFirst { it.id == bookId }
-                if (index != -1) {
-                    currentBooks[index] = finalBook
-                    val metadataFile = File(applicationContext.filesDir, "books_metadata.json")
-                    val jsonString = Json.encodeToString(currentBooks)
-                    metadataFile.writeText(jsonString)
-                }
-
-                // Show success notification
-                showSuccessNotification(title)
-
-                return@withContext Result.success()
             }
 
+            // Delete zip file
+            zipFile.delete()
+            Log.d(TAG, "Deleted ZIP file")
+
+            if (audioPath.isEmpty() || textPath.isEmpty()) {
+                Log.e(TAG, "Missing required files - audio: $audioPath, text: $textPath")
+                bookManager.updateBookStatus(bookId, BookStatus.ERROR)
+                showErrorNotification(title, "Downloaded file is incomplete (missing audio or text)")
+                return@withContext Result.failure(
+                    workDataOf("error" to "Incomplete download - missing required files")
+                )
+            }
+
+            // Get audio duration
+            val timestamps = if (File(timestampsPath).exists()) {
+                try {
+                    val json = File(timestampsPath).readText()
+                    Json.decodeFromString<List<WordTimestamp>>(json)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to parse timestamps: ${e.message}")
+                    emptyList()
+                }
+            } else {
+                Log.w(TAG, "No timestamps file found")
+                emptyList()
+            }
+
+            val durationSeconds = timestamps.lastOrNull()?.end?.toInt() ?: 0
+            val durationFormatted = formatDuration(durationSeconds)
+
+            Log.d(TAG, "Audio duration: $durationFormatted ($durationSeconds seconds)")
+
+            // Create final Book object with READY status
+            val finalBook = Book(
+                id = bookId,
+                title = title,
+                audioPath = audioPath,
+                timestampsPath = timestampsPath,
+                textPath = textPath,
+                wordCount = wordCount,
+                duration = durationFormatted,
+                status = BookStatus.READY
+            )
+
+            // Update book in metadata
+            val updatedBooks = bookManager.getBooks().toMutableList() // Fixing duplicate currentBooks declaration
+            val index = updatedBooks.indexOfFirst { it.id == bookId }
+            if (index != -1) {
+                updatedBooks[index] = finalBook
+                val metadataFile = File(applicationContext.filesDir, "books_metadata.json")
+                val jsonString = Json.encodeToString(updatedBooks)
+                metadataFile.writeText(jsonString)
+                Log.d(TAG, "Updated book metadata")
+            } else {
+                Log.w(TAG, "Book not found in metadata, index: $index")
+            }
+
+            // Show success notification
+            showSuccessNotification(title)
+            Log.d(TAG, "Conversion completed successfully")
+
+            Result.success()
+
         } catch (e: Exception) {
+            Log.e(TAG, "Conversion failed with exception", e)
             e.printStackTrace()
             bookManager.updateBookStatus(bookId, BookStatus.ERROR)
-            showErrorNotification(title, e.message ?: "Unknown error")
+            showErrorNotification(title, e.message ?: "Unknown error occurred")
             Result.failure(
                 workDataOf("error" to (e.message ?: "Unknown error"))
             )
@@ -209,7 +387,7 @@ class ConversionWorker(
         val intent = Intent(applicationContext, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
         }
-        
+
         val pendingIntent = PendingIntent.getActivity(
             applicationContext,
             0,
@@ -236,6 +414,7 @@ class ConversionWorker(
             .setSmallIcon(android.R.drawable.ic_dialog_alert)
             .setAutoCancel(true)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setStyle(NotificationCompat.BigTextStyle().bigText("$title: $error"))
             .build()
 
         notificationManager.notify(NOTIFICATION_ID + 2, notification)

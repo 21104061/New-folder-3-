@@ -20,7 +20,8 @@ data class Book(
     val dateAdded: Long = System.currentTimeMillis(),
     val status: BookStatus = BookStatus.READY,
     val fileSize: Long = 0L,
-    val lastUpdated: Long = System.currentTimeMillis()
+    val lastUpdated: Long = System.currentTimeMillis(),
+    val jobId: String? = null // For async conversion tracking
 ) {
     fun getText(): String {
         return File(textPath).readText()

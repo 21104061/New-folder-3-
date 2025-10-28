@@ -1,6 +1,5 @@
 package com.hollow.ttsreader
 
-// --- CORRECTED IMPORTS ---
 import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -28,30 +27,16 @@ import androidx.compose.ui.unit.sp
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.workDataOf
-import com.hollow.ttsreader.TTSReaderTheme
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
-import java.text.SimpleDateFormat
-import java.util.*
-// --- IMPORTS END HERE ---
+import java.util.UUID
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (android.os.Build.VERSION.SDK_INT >= 33) {
-            val granted = androidx.core.content.ContextCompat.checkSelfPermission(
-                this,
-                android.Manifest.permission.POST_NOTIFICATIONS
-            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
-            if (!granted) {
-                androidx.core.app.ActivityCompat.requestPermissions(
-                    this,
-                    arrayOf(android.Manifest.permission.POST_NOTIFICATIONS),
-                    1001
-                )
-            }
-        }
         setContent {
             TTSReaderTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
@@ -134,7 +119,6 @@ fun TTSReaderApp() {
             when (val screen = currentScreen) {
                 Screen.Library -> {
                     LibraryScreen(
-                        bookManager = bookManager,
                         books = books,
                         onBookClick = { book ->
                             selectedBook = book
@@ -221,7 +205,6 @@ fun UploadScreen(
                 }
             }
         } else if (showError) {
-            // Show error message
             Column(
                 modifier = Modifier
                     .fillMaxSize()
@@ -248,7 +231,7 @@ fun UploadScreen(
                     textAlign = TextAlign.Center
                 )
                 Spacer(modifier = Modifier.height(24.dp))
-                Button(onClick = { 
+                Button(onClick = {
                     showError = false
                     errorMessage = ""
                 }) {
@@ -300,72 +283,86 @@ fun UploadScreen(
                     Text("Stream Audio")
                 }
 
-                // Download Button
+                // Download Button - FIXED VERSION
                 Button(
                     onClick = {
                         if (titleState.isNotBlank() && textState.text.isNotBlank()) {
                             showEmptyError = false
-                            
+
                             scope.launch {
                                 try {
-                                    // Validate server URL
-                                    val serverUrl = appPrefs.serverUrl
-                                    if (serverUrl.isBlank() || !serverUrl.startsWith("http")) {
+                                    isLoading = true
+                                    loadingMessage = "Validating server connection..."
+
+                                    // First, check if server is reachable
+                                    val serverReachable = withContext(Dispatchers.IO) {
+                                        ServerAPI.checkServerStatus(appPrefs.serverUrl)
+                                    }
+
+                                    if (!serverReachable) {
+                                        isLoading = false
                                         showError = true
-                                        errorMessage = "Invalid server URL. Please set it in Settings."
+                                        errorMessage = "Cannot reach server at ${appPrefs.serverUrl}. Please check your server URL in Settings and ensure the Colab notebook is running."
                                         return@launch
                                     }
+
+                                    loadingMessage = "Server connected. Starting conversion..."
+
                                     // Create book immediately with CONVERTING status
                                     val bookId = UUID.randomUUID().toString()
                                     val bookManager = BookManager(context)
                                     val bookDir = bookManager.createBookDirectory(bookId)
-                                    
+
                                     // Save text file immediately
                                     val textFile = File(bookDir, "book_text.txt")
                                     textFile.writeText(textState.text)
-                                    
+
                                     // Calculate word count
                                     val wordCount = textState.text.split(Regex("\\s+")).size
-                                    
+
                                     // Create placeholder book with CONVERTING status
                                     val placeholderBook = Book(
                                         id = bookId,
                                         title = titleState,
-                                        audioPath = "",  // Will be filled later
+                                        audioPath = "",
                                         timestampsPath = "",
                                         textPath = textFile.absolutePath,
                                         wordCount = wordCount,
                                         duration = "",
-                                        status = BookStatus.CONVERTING
+                                        status = BookStatus.CONVERTING,
+                                        jobId = null // Will be set by worker
                                     )
-                                    
+
                                     // Save to library
                                     bookManager.saveBook(placeholderBook)
-                                    
+
+                                    loadingMessage = "Book added to library. Starting background conversion..."
+
                                     // Schedule background conversion
                                     val workRequest = OneTimeWorkRequestBuilder<ConversionWorker>()
-                                        .setConstraints(
-                                            androidx.work.Constraints.Builder()
-                                                .setRequiredNetworkType(androidx.work.NetworkType.CONNECTED)
-                                                .build()
-                                        )
                                         .setInputData(
                                             workDataOf(
                                                 ConversionWorker.KEY_BOOK_ID to bookId,
                                                 ConversionWorker.KEY_BOOK_TITLE to titleState,
-                                                ConversionWorker.KEY_BOOK_TEXT to textState.text,
                                                 ConversionWorker.KEY_SERVER_URL to appPrefs.serverUrl,
                                                 ConversionWorker.KEY_WORD_COUNT to wordCount
                                             )
                                         )
                                         .build()
-                                    
+
                                     WorkManager.getInstance(context).enqueue(workRequest)
-                                    
+
+                                    // Small delay to show the message
+                                    delay(1000)
+
                                     // Navigate back to library
+                                    isLoading = false
                                     onCancel()
-                                    
+
                                 } catch (e: Exception) {
+                                    isLoading = false
+                                    showError = true
+                                    errorMessage = "Failed to start conversion: ${e.message ?: "Unknown error"}"
                                     println("Error starting conversion: ${e.message}")
                                     e.printStackTrace()
                                 }
@@ -374,9 +371,17 @@ fun UploadScreen(
                             showEmptyError = true
                         }
                     },
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.weight(1f),
+                    enabled = !isLoading
                 ) {
-                    Text("Download & Save")
+                    if (isLoading) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            strokeWidth = 2.dp
+                        )
+                    } else {
+                        Text("Download & Save")
+                    }
                 }
             }
         }
@@ -385,24 +390,21 @@ fun UploadScreen(
 
 @Composable
 fun LibraryScreen(
-    bookManager: BookManager, 
     books: List<Book>,
     onBookClick: (Book) -> Unit,
     onRefresh: () -> Unit
 ) {
-    var deletedBooks by remember { mutableStateOf<List<Book>>(emptyList()) }
+    val context = LocalContext.current
+    val bookManager = remember { BookManager(context) }
     var selectionMode by remember { mutableStateOf(false) }
     var selectedIds by remember { mutableStateOf(setOf<String>()) }
+    var deletedBooks by remember { mutableStateOf<List<Book>>(emptyList()) }
 
-    val hasConvertingBooks = books.any { 
-        it.status == BookStatus.CONVERTING || it.status == BookStatus.DOWNLOADING 
+    // Auto-refresh every 2 seconds if there are converting books
+    val hasConvertingBooks = books.any {
+        it.status == BookStatus.CONVERTING || it.status == BookStatus.DOWNLOADING
     }
 
-    LaunchedEffect(Unit) {
-        deletedBooks = bookManager.cleanupStaleBooks()
-        onRefresh()
-    }
-    
     LaunchedEffect(hasConvertingBooks) {
         if (hasConvertingBooks) {
             while (true) {
@@ -412,24 +414,46 @@ fun LibraryScreen(
         }
     }
 
+    // Auto-cleanup stale books every 30 seconds
+    LaunchedEffect(Unit) {
+        while (true) {
+            val staleBooks = bookManager.cleanupStaleBooks(2 * 60 * 60 * 1000) // 2 hours
+            if (staleBooks.isNotEmpty()) {
+                deletedBooks = staleBooks
+                onRefresh()
+            }
+            delay(30000) // Check every 30 seconds
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        onRefresh()
+    }
+
     Column(modifier = Modifier.fillMaxSize()) {
+        // Show deleted books report if any
         if (deletedBooks.isNotEmpty()) {
             DeletedBooksReport(deletedBooks) { deletedBooks = emptyList() }
         }
 
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            AssistChip(
-                onClick = { selectionMode = !selectionMode; if (!selectionMode) selectedIds = emptySet() },
-                label = { Text(if (selectionMode) "Done Selecting" else "Select") },
-                leadingIcon = { Icon(Icons.Default.Checklist, contentDescription = null) }
-            )
-            if (books.isNotEmpty()) {
+        // Selection controls
+        if (books.isNotEmpty()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                AssistChip(
+                    onClick = { 
+                        selectionMode = !selectionMode
+                        if (!selectionMode) selectedIds = emptySet()
+                    },
+                    label = { Text(if (selectionMode) "Done Selecting" else "Select") },
+                    leadingIcon = { Icon(Icons.Default.Checklist, contentDescription = null) }
+                )
+                
                 AssistChip(
                     onClick = {
                         selectionMode = true
@@ -438,21 +462,22 @@ fun LibraryScreen(
                     label = { Text("Select All") },
                     leadingIcon = { Icon(Icons.Default.SelectAll, contentDescription = null) }
                 )
+                
+                val canDelete = selectedIds.isNotEmpty()
+                AssistChip(
+                    onClick = {
+                        if (canDelete) {
+                            selectedIds.forEach { bookManager.deleteBook(it) }
+                            selectedIds = emptySet()
+                            selectionMode = false
+                            onRefresh()
+                        }
+                    },
+                    enabled = canDelete,
+                    label = { Text("Delete Selected") },
+                    leadingIcon = { Icon(Icons.Default.Delete, contentDescription = null) }
+                )
             }
-            val canDelete = selectedIds.isNotEmpty()
-            AssistChip(
-                onClick = {
-                    if (canDelete) {
-                        selectedIds.forEach { bookManager.deleteBook(it) }
-                        selectedIds = emptySet()
-                        selectionMode = false
-                        onRefresh()
-                    }
-                },
-                enabled = canDelete,
-                label = { Text("Delete Selected") },
-                leadingIcon = { Icon(Icons.Default.Delete, contentDescription = null) }
-            )
         }
 
         if (books.isEmpty()) {
@@ -483,15 +508,14 @@ fun LibraryScreen(
                     BookCard(
                         book = book,
                         onClick = {
-                            if (book.status == BookStatus.READY) {
+                            if (selectionMode) {
+                                selectedIds = if (selected) selectedIds - book.id else selectedIds + book.id
+                            } else if (book.status == BookStatus.READY) {
                                 onBookClick(book)
                             }
                         },
                         showCheckbox = selectionMode,
                         selected = selected,
-                        onSelectToggle = {
-                            selectedIds = if (selected) selectedIds - book.id else selectedIds + book.id
-                        },
                         onDelete = {
                             bookManager.deleteBook(book.id)
                             onRefresh()
@@ -504,58 +528,15 @@ fun LibraryScreen(
 }
 
 @Composable
-fun DeletedBooksReport(deletedBooks: List<Book>, onDismiss: () -> Unit) {
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(16.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.errorContainer
-        ),
-        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Default.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.onErrorContainer)
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("Cleanup Report", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onErrorContainer)
-                Spacer(modifier = Modifier.weight(1f))
-                IconButton(onClick = onDismiss) {
-                    Icon(Icons.Default.Close, contentDescription = "Dismiss")
-                }
-            }
-            Spacer(modifier = Modifier.height(8.dp))
-            Text("The following books were deleted because they were converting for more than 2 hours:", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onErrorContainer)
-            Spacer(modifier = Modifier.height(8.dp))
-            deletedBooks.forEach {
-                Text("- ${it.title}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onErrorContainer)
-            }
-        }
-    }
-}
-
-fun formatFileSize(size: Long): String {
-    if (size <= 0) return "0 B"
-    val units = arrayOf("B", "KB", "MB", "GB", "TB")
-    val digitGroups = (Math.log10(size.toDouble()) / Math.log10(1024.0)).toInt()
-    return "%.1f %s".format(size / Math.pow(1024.0, digitGroups.toDouble()), units[digitGroups])
-}
-
-fun formatDate(timestamp: Long): String {
-    val sdf = SimpleDateFormat("MMM d, yyyy - h:mm a", Locale.getDefault())
-    return sdf.format(Date(timestamp))
-}
-
-@Composable
 fun BookCard(
-    book: Book,
+    book: Book, 
     onClick: () -> Unit,
-    showCheckbox: Boolean,
-    selected: Boolean,
-    onSelectToggle: () -> Unit,
-    onDelete: () -> Unit
+    showCheckbox: Boolean = false,
+    selected: Boolean = false,
+    onDelete: () -> Unit = {}
 ) {
     val isClickable = book.status == BookStatus.READY
+
     Card(
         modifier = Modifier
             .fillMaxWidth()
@@ -563,9 +544,12 @@ fun BookCard(
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
         colors = CardDefaults.cardColors(
             containerColor = when (book.status) {
-                BookStatus.CONVERTING, BookStatus.DOWNLOADING -> MaterialTheme.colorScheme.surfaceVariant
-                BookStatus.ERROR -> MaterialTheme.colorScheme.errorContainer
-                else -> MaterialTheme.colorScheme.surface
+                BookStatus.CONVERTING, BookStatus.DOWNLOADING ->
+                    MaterialTheme.colorScheme.surfaceVariant
+                BookStatus.ERROR ->
+                    MaterialTheme.colorScheme.errorContainer
+                else ->
+                    MaterialTheme.colorScheme.surface
             }
         )
     ) {
@@ -575,10 +559,16 @@ fun BookCard(
                 .fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
         ) {
+            // Checkbox for selection mode
             if (showCheckbox) {
-                Checkbox(checked = selected, onCheckedChange = { onSelectToggle() })
+                Checkbox(
+                    checked = selected,
+                    onCheckedChange = { onClick() }
+                )
                 Spacer(modifier = Modifier.width(8.dp))
             }
+            
+            // Icon based on status
             when (book.status) {
                 BookStatus.CONVERTING, BookStatus.DOWNLOADING -> {
                     CircularProgressIndicator(
@@ -603,7 +593,9 @@ fun BookCard(
                     )
                 }
             }
+
             Spacer(modifier = Modifier.width(16.dp))
+
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text = book.title,
@@ -611,15 +603,14 @@ fun BookCard(
                     fontWeight = FontWeight.SemiBold
                 )
                 Spacer(modifier = Modifier.height(4.dp))
+
                 val statusText = when (book.status) {
                     BookStatus.CONVERTING -> "Converting..."
                     BookStatus.DOWNLOADING -> "Downloading..."
                     BookStatus.ERROR -> "Conversion failed"
-                    BookStatus.READY -> {
-                        val fileSize = formatFileSize(book.fileSize)
-                        "${book.wordCount} words • ${book.duration.ifBlank { "N/A" }} • $fileSize"
-                    }
+                    BookStatus.READY -> "${book.wordCount} words • ${book.duration.ifBlank { "N/A" }}"
                 }
+
                 Text(
                     text = statusText,
                     style = MaterialTheme.typography.bodySmall,
@@ -628,18 +619,64 @@ fun BookCard(
                         else -> MaterialTheme.colorScheme.onSurfaceVariant
                     }
                 )
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                    text = "Added: ${formatDate(book.dateAdded)}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
             }
-            IconButton(onClick = onDelete) {
-                Icon(Icons.Default.Delete, contentDescription = "Delete")
+
+            // Delete button (only show when not in selection mode)
+            if (!showCheckbox) {
+                IconButton(onClick = onDelete) {
+                    Icon(Icons.Default.Delete, contentDescription = "Delete Book")
+                }
             }
-            if (isClickable) {
+
+            if (isClickable && !showCheckbox) {
                 Icon(Icons.Default.ChevronRight, contentDescription = "Open Book")
+            }
+        }
+    }
+}
+
+@Composable
+fun DeletedBooksReport(deletedBooks: List<Book>, onDismiss: () -> Unit) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(16.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.errorContainer
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Default.Warning, 
+                    contentDescription = null, 
+                    tint = MaterialTheme.colorScheme.onErrorContainer
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    "Auto-cleanup Report", 
+                    style = MaterialTheme.typography.titleMedium, 
+                    color = MaterialTheme.colorScheme.onErrorContainer
+                )
+                Spacer(modifier = Modifier.weight(1f))
+                IconButton(onClick = onDismiss) {
+                    Icon(Icons.Default.Close, contentDescription = "Dismiss")
+                }
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                "The following books were automatically deleted because they were stuck in conversion for more than 2 hours:", 
+                style = MaterialTheme.typography.bodyMedium, 
+                color = MaterialTheme.colorScheme.onErrorContainer
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            deletedBooks.forEach { book ->
+                Text(
+                    "• ${book.title}", 
+                    style = MaterialTheme.typography.bodySmall, 
+                    color = MaterialTheme.colorScheme.onErrorContainer
+                )
             }
         }
     }
@@ -656,7 +693,7 @@ fun SettingsScreen(appPrefs: AppPreferences, onSaved: () -> Unit) {
     var showUrlError by remember { mutableStateOf(false) }
 
     fun isValidUrl(url: String): Boolean {
-        return url.isNotBlank() && url.startsWith("http") && (url.contains("playit.gg") || url.contains("cloudflare"))
+        return url.isNotBlank() && url.startsWith("http") && (url.contains("playit.gg") || url.contains("cloudflare") || url.contains("trycloudflare.com"))
     }
 
     Column(
@@ -683,7 +720,7 @@ fun SettingsScreen(appPrefs: AppPreferences, onSaved: () -> Unit) {
                 modifier = Modifier.fillMaxWidth()
             )
             Text(
-                text = "First, let\'s connect to your Colab server.",
+                text = "First, let's connect to your Colab server.",
                 style = MaterialTheme.typography.bodyLarge,
                 textAlign = TextAlign.Center,
                 modifier = Modifier.fillMaxWidth(),
@@ -706,7 +743,7 @@ fun SettingsScreen(appPrefs: AppPreferences, onSaved: () -> Unit) {
                 showUrlError = false
             },
             label = { Text("Server URL") },
-            placeholder = { Text("https://xxxxx.playit.gg or Cloudflare URL") },
+            placeholder = { Text("https://xxxxx.trycloudflare.com") },
             leadingIcon = { Icon(Icons.Default.Link, contentDescription = null) },
             modifier = Modifier.fillMaxWidth(),
             singleLine = true,
@@ -730,12 +767,14 @@ fun SettingsScreen(appPrefs: AppPreferences, onSaved: () -> Unit) {
                         isTestingConnection = true
                         connectionStatus = null
 
-                        val isOnline = ServerAPI.checkServerStatus(serverUrlInput)
+                        val isOnline = withContext(Dispatchers.IO) {
+                            ServerAPI.checkServerStatus(serverUrlInput)
+                        }
 
                         connectionStatus = if (isOnline) {
                             Pair(true, "✅ Connection successful!")
                         } else {
-                            Pair(false, "❌ Cannot connect. Check URL and ensure Colab server is running & accessible.")
+                            Pair(false, "❌ Cannot connect. Check URL and ensure Colab server is running.")
                         }
 
                         isTestingConnection = false
@@ -806,8 +845,8 @@ fun SettingsScreen(appPrefs: AppPreferences, onSaved: () -> Unit) {
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
                     text = """1. Run the Python script in Google Colab.
-2. Wait for the URL from playit.gg or Cloudflare tunnel.
-3. Copy the full URL (starting with http).
+2. Wait for the Cloudflare tunnel URL.
+3. Copy the full URL (starting with https://).
 4. Paste it into the field above.""",
                     style = MaterialTheme.typography.bodySmall,
                     lineHeight = 18.sp
@@ -826,7 +865,9 @@ fun SettingsScreen(appPrefs: AppPreferences, onSaved: () -> Unit) {
                     scope.launch {
                         isTestingConnection = true
                         connectionStatus = null
-                        val isOnline = ServerAPI.checkServerStatus(serverUrlInput)
+                        val isOnline = withContext(Dispatchers.IO) {
+                            ServerAPI.checkServerStatus(serverUrlInput)
+                        }
                         if (isOnline) {
                             appPrefs.serverUrl = serverUrlInput
                             onSaved()

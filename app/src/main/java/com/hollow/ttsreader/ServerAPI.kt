@@ -6,6 +6,7 @@ import com.hollow.ttsreader.BookManager
 import com.hollow.ttsreader.WordTimestamp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -35,12 +36,34 @@ object ServerAPI {
     private val client = OkHttpClient.Builder()
         .addInterceptor(loggingInterceptor)
         .retryOnConnectionFailure(true)
-        .connectTimeout(2, java.util.concurrent.TimeUnit.MINUTES)
-        .readTimeout(60, java.util.concurrent.TimeUnit.MINUTES)
-        .writeTimeout(60, java.util.concurrent.TimeUnit.MINUTES)
+        .connectTimeout(5, java.util.concurrent.TimeUnit.MINUTES)
+        .readTimeout(150, java.util.concurrent.TimeUnit.MINUTES) // 2.5 hours
+        .writeTimeout(150, java.util.concurrent.TimeUnit.MINUTES) // 2.5 hours
         .build()
 
     private val json = Json { ignoreUnknownKeys = true }
+
+    // Data classes for async API responses
+    @Serializable
+    data class AsyncJobResponse(
+        val job_id: String,
+        val status: String,
+        val message: String
+    )
+
+    @Serializable
+    data class JobStatusResponse(
+        val job_id: String,
+        val status: String,
+        val progress: String? = null,
+        val title: String,
+        val started_at: Double,
+        val completed_at: Double? = null,
+        val elapsed_time: Double? = null,
+        val total_time: Double? = null,
+        val error: String? = null,
+        val download_url: String? = null
+    )
 
     suspend fun streamAudio(
         text: String,
@@ -149,13 +172,76 @@ object ServerAPI {
             put("title", title)
         }.toString()
 
-        val requestBody = jsonPayload.toRequestBody("application/json".toMediaType())
+        val requestBody = jsonPayload.toRequestBody("application/json; charset=utf-8".toMediaType())
 
         val request = Request.Builder()
             .url("$serverUrl/convert")
+            .addHeader("Accept", "application/zip")
+            .addHeader("Content-Type", "application/json; charset=utf-8")
             .post(requestBody)
             .build()
 
-        return@withContext client.newCall(request).execute()
+        client.newCall(request).execute()
+    }
+
+    // New async methods
+    suspend fun startAsyncConversion(
+        title: String,
+        text: String,
+        serverUrl: String
+    ): AsyncJobResponse = withContext(Dispatchers.IO) {
+        val jsonPayload = buildJsonObject {
+            put("text", text)
+            put("title", title)
+        }.toString()
+
+        val requestBody = jsonPayload.toRequestBody("application/json; charset=utf-8".toMediaType())
+
+        val request = Request.Builder()
+            .url("$serverUrl/convert-async")
+            .addHeader("Content-Type", "application/json; charset=utf-8")
+            .post(requestBody)
+            .build()
+
+        val response = client.newCall(request).execute()
+        
+        if (!response.isSuccessful) {
+            throw Exception("Server error: ${response.code} ${response.message}")
+        }
+
+        val responseBody = response.body?.string() ?: throw Exception("Empty response")
+        json.decodeFromString<AsyncJobResponse>(responseBody)
+    }
+
+    suspend fun getJobStatus(
+        jobId: String,
+        serverUrl: String
+    ): JobStatusResponse = withContext(Dispatchers.IO) {
+        val request = Request.Builder()
+            .url("$serverUrl/status/$jobId")
+            .get()
+            .build()
+
+        val response = client.newCall(request).execute()
+        
+        if (!response.isSuccessful) {
+            throw Exception("Server error: ${response.code} ${response.message}")
+        }
+
+        val responseBody = response.body?.string() ?: throw Exception("Empty response")
+        json.decodeFromString<JobStatusResponse>(responseBody)
+    }
+
+    suspend fun downloadCompletedJob(
+        jobId: String,
+        serverUrl: String
+    ): Response = withContext(Dispatchers.IO) {
+        val request = Request.Builder()
+            .url("$serverUrl/download/$jobId")
+            .addHeader("Accept", "application/zip")
+            .get()
+            .build()
+
+        client.newCall(request).execute()
     }
 }
