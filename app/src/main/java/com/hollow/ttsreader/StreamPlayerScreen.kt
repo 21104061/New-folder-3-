@@ -243,12 +243,13 @@ fun StreamPlayerScreen(text: String, serverUrl: String) {
     var isLoading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
     var isPlaying by remember { mutableStateOf(false) }
-    var playbackSpeed by remember { mutableStateOf(1.0f) }
     var streamEnded by remember { mutableStateOf(false) }
     var debugLog by remember { mutableStateOf("Initializing...") }
     var chunksReceived by remember { mutableStateOf(0) }
     var totalChunks by remember { mutableStateOf(0) }
     var highlightedWordIndex by remember { mutableStateOf(0) }
+    var currentTime by remember { mutableStateOf(0f) }
+    var totalDuration by remember { mutableStateOf(0f) }
     val words = remember { text.split(" ") }
 
     val scope = rememberCoroutineScope()
@@ -413,17 +414,22 @@ fun StreamPlayerScreen(text: String, serverUrl: String) {
                                                     // switch to reading audio for next part
                                                     readingAudio = true
                                                     val wordIndex = json.optInt("word_index", -1)
-                                                    if (wordIndex >= 0) {
-                                                        withContext(Dispatchers.Main) {
+                                                    val startTime = json.optDouble("start_time", 0.0)
+                                                    withContext(Dispatchers.Main) {
+                                                        if (wordIndex >= 0) {
                                                             highlightedWordIndex = wordIndex
                                                         }
+                                                        currentTime = startTime.toFloat()
                                                     }
                                                 }
                                                 "end_of_stream" -> {
-                                                    val totalDuration = json.optDouble("total_duration", 0.0)
+                                                    val duration = json.optDouble("total_duration", 0.0)
                                                     val finalChunkCount = json.optInt("total_chunks", totalChunks)
+                                                    withContext(Dispatchers.Main) {
+                                                        totalDuration = duration.toFloat()
+                                                    }
                                                     streamCompleteFlag.set(true)
-                                                    debugLog = "Stream complete: $chunksReceived/$finalChunkCount chunks, ${totalDuration.toFloat()}s"
+                                                    debugLog = "Stream complete: $chunksReceived/$finalChunkCount chunks, ${duration.toFloat()}s"
                                                     break
                                                 }
                                             }
@@ -524,10 +530,11 @@ fun StreamPlayerScreen(text: String, serverUrl: String) {
         onDispose {}
     }
 
-    LaunchedEffect(playbackSpeed, player) {
-        player?.let {
-            val params = PlaybackParameters(playbackSpeed)
-            it.playbackParameters = params
+    // Timer to update current playback time
+    LaunchedEffect(isPlaying) {
+        while (isPlaying && isActive) {
+            delay(100)
+            currentTime += 0.1f
         }
     }
 
@@ -603,10 +610,29 @@ fun StreamPlayerScreen(text: String, serverUrl: String) {
                             )
                         ) {
                             Column(modifier = Modifier.padding(8.dp)) {
-                                Text(
-                                    "Status: $debugLog",
-                                    style = MaterialTheme.typography.bodySmall
-                                )
+                                // Time display
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text(
+                                        formatTime(currentTime),
+                                        style = MaterialTheme.typography.bodyMedium
+                                    )
+                                    if (totalDuration > 0) {
+                                        Text(
+                                            formatTime(totalDuration),
+                                            style = MaterialTheme.typography.bodyMedium
+                                        )
+                                    } else {
+                                        Text(
+                                            "Live Stream",
+                                            style = MaterialTheme.typography.bodyMedium
+                                        )
+                                    }
+                                }
+                                
+                                // Progress bar for buffering
                                 if (totalChunks > 0) {
                                     LinearProgressIndicator(
                                         progress = chunksReceived.toFloat() / totalChunks.toFloat(),
@@ -615,6 +641,11 @@ fun StreamPlayerScreen(text: String, serverUrl: String) {
                                             .padding(vertical = 4.dp)
                                     )
                                 }
+                                
+                                Text(
+                                    "Status: $debugLog",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
                             }
                         }
 
@@ -673,17 +704,16 @@ fun StreamPlayerScreen(text: String, serverUrl: String) {
                                     contentDescription = "Next Word"
                                 )
                             }
-
-                            Spacer(modifier = Modifier.height(16.dp))
-
-                            Text("Playback Speed: ${(playbackSpeed * 100).roundToInt() / 100f}x")
-                            Slider(
-                                value = playbackSpeed,
-                                onValueChange = { newSpeed -> playbackSpeed = newSpeed },
-                                valueRange = 0.5f..2.0f,
-                                steps = 5
-                            )
                         }
+                        
+                        Spacer(modifier = Modifier.height(8.dp))
+                        
+                        Text(
+                            "Note: Streaming audio doesn't support seek or speed control",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center
+                        )
                     }
                 }
             }
@@ -698,4 +728,18 @@ private fun trimNewlines(bytes: ByteArray): ByteArray {
     while (start < end && (bytes[start] == '\n'.code.toByte() || bytes[start] == '\r'.code.toByte())) start++
     while (end > start && (bytes[end - 1] == '\n'.code.toByte() || bytes[end - 1] == '\r'.code.toByte())) end--
     return if (start == 0 && end == bytes.size) bytes else bytes.copyOfRange(start, end)
+}
+
+// Format seconds to MM:SS or HH:MM:SS
+private fun formatTime(seconds: Float): String {
+    val totalSeconds = seconds.toInt()
+    val hours = totalSeconds / 3600
+    val minutes = (totalSeconds % 3600) / 60
+    val secs = totalSeconds % 60
+    
+    return if (hours > 0) {
+        String.format("%d:%02d:%02d", hours, minutes, secs)
+    } else {
+        String.format("%02d:%02d", minutes, secs)
+    }
 }

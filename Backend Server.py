@@ -915,11 +915,11 @@ def stream():
 
         # === Generator that streams audio from Piper sequentially ===
         def generate():
-            # Assume standard Piper WAV output: 22050 Hz, 16-bit (2 bytes per sample), mono (1 channel)
+            # Raw PCM format (after FFmpeg conversion): 22050 Hz, 16-bit (2 bytes per sample), mono (1 channel)
             sample_rate = 22050
             bytes_per_sample = 2
             num_channels = 1
-            bytes_per_second = sample_rate * bytes_per_sample * num_channels if sample_rate > 0 and bytes_per_sample > 0 else 0 # Avoid division by zero
+            bytes_per_second = sample_rate * bytes_per_sample * num_channels if sample_rate > 0 and bytes_per_sample > 0 else 0 # Avoid division by zero (44100 bytes/sec)
 
             cumulative_duration = 0.0 # Initialize cumulative duration
 
@@ -938,23 +938,49 @@ def stream():
 
             for i, chunk in enumerate(chunks, 1):
                 print(f"🔊 Generating chunk {i}/{len(chunks)} ({len(chunk)} chars)")
-                # Using communicate directly for smaller outputs or sufficient RAM
-                process = subprocess.Popen(
-                    ["piper", "--model", PIPER_MODEL, "--output_file", "-"],
+                
+                # Pipe Piper through FFmpeg to get raw PCM data
+                # Piper outputs WAV, FFmpeg converts to raw PCM s16le mono 22050
+                piper_cmd = ["piper", "--model", PIPER_MODEL, "--output_file", "-"]
+                ffmpeg_cmd = ["ffmpeg", "-f", "wav", "-i", "pipe:0", 
+                             "-f", "s16le", "-ac", "1", "-ar", "22050", "pipe:1",
+                             "-y", "-loglevel", "error"]
+                
+                # Start Piper process
+                piper_process = subprocess.Popen(
+                    piper_cmd,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE
                 )
+                
+                # Start FFmpeg process, reading from Piper's stdout
+                ffmpeg_process = subprocess.Popen(
+                    ffmpeg_cmd,
+                    stdin=piper_process.stdout,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+                
+                # Close Piper's stdout to avoid deadlock
+                piper_process.stdout.close()
+                
+                # Send text to Piper and get PCM from FFmpeg
+                out, err = piper_process.communicate(input=chunk.encode('utf-8'))
+                pcm_data, ffmpeg_err = ffmpeg_process.communicate()
+                
+                # Check both processes for errors
+                if piper_process.returncode != 0:
+                    error_message = out.decode('utf-8', errors='replace')
+                elif ffmpeg_process.returncode != 0:
+                    error_message = ffmpeg_err.decode('utf-8', errors='replace')
+                else:
+                    error_message = None
+                
+                chunk_audio_data = pcm_data # Raw PCM data from FFmpeg
 
-                out, err = process.communicate(input=chunk.encode('utf-8'))
-                chunk_audio_data = out # Audio data is in stdout
-
-                if process.returncode != 0:
-                    try:
-                        error_message = err.decode('utf-8', errors='replace')
-                    except Exception:
-                        error_message = "Undecodable Piper stderr output during chunk"
-                    print(f"❌ Piper error during chunk {i}: {error_message}")
+                if error_message:
+                    print(f"❌ TTS error during chunk {i}: {error_message}")
                     # Optionally send an error message chunk to the client
                     error_message_chunk = {
                         "type": "error",
@@ -967,10 +993,10 @@ def stream():
                     yield NEWLINE
                     continue # Skip this chunk and move to the next
 
-
                 # Calculate duration of the current audio chunk
                 current_chunk_duration = len(chunk_audio_data) / bytes_per_second if bytes_per_second > 0 else 0
 
+                # ... (rest of the code remains the same)
 
                 # --- Prepare and yield timestamp message for this chunk ---
                 chunk_start_time = cumulative_duration # Start time of this chunk is the current cumulative duration

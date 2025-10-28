@@ -565,7 +565,7 @@ fun SettingsScreen(appPrefs: AppPreferences, onSaved: () -> Unit) {
                 showUrlError = false
             },
             label = { Text("Server URL") },
-            placeholder = { Text("http://xxxxx.playit.gg or Cloudflare URL") },
+            placeholder = { Text("https://xxxxx.playit.gg or Cloudflare URL") },
             leadingIcon = { Icon(Icons.Default.Link, contentDescription = null) },
             modifier = Modifier.fillMaxWidth(),
             singleLine = true,
