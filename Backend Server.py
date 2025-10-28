@@ -22,13 +22,18 @@ print("📦 Installing dependencies...")
 
 # Dependency check
 try:
-    import piper_tts
     import flask
     import flask_cors
     import whisper_timestamped
     import requests
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    
+    # Check if piper command is available (it's a CLI tool, not a Python module)
+    piper_check = subprocess.run("which piper", shell=True, capture_output=True)
+    if piper_check.returncode != 0:
+        print("⚠️ Piper TTS not found in PATH, will be installed with piper-tts package")
+    
     print("✅ Dependencies installed successfully.")
 except ImportError as e:
     print(f"❌ Missing dependency: {e}")
@@ -38,55 +43,118 @@ except ImportError as e:
 # STEP 2: Setup Cloudflare Tunnel
 # ========================================
 print("\n🌐 Setting up Cloudflare Tunnel...")
-!wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-!dpkg -i cloudflared-linux-amd64.deb
 
-if not os.path.exists("/usr/local/bin/cloudflared"):
-    print("❌ Cloudflare Tunnel executable not found.")
-    sys.exit("Cloudflare installation failed.")
+if os.path.exists("/usr/local/bin/cloudflared"):
+    print("✅ Cloudflare already installed, skipping download")
+else:
+    print("Downloading cloudflared...")
+    !wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+    !dpkg -i cloudflared-linux-amd64.deb
+    
+    if not os.path.exists("/usr/local/bin/cloudflared"):
+        print("❌ Cloudflare Tunnel executable not found.")
+        sys.exit("Cloudflare installation failed.")
+    print("✅ Cloudflare installed successfully")
 
 # ========================================
 # STEP 2.5: Load Local LLM (gpt-oss-20b)
 # ========================================
-print("\n🤖 Loading gpt-oss-20b model (this may take a few minutes)...")
+print("\n🤖 Loading gpt-oss-20b model...")
 print("   Model size: ~13.8GB")
 
 # Load model and tokenizer
 model_name = "Qwen/Qwen2.5-7B-Instruct"
 
-try:
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    
-    # Load model with quantization for memory efficiency
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.float16,
-        device_map="auto",
-        load_in_8bit=True,
-        trust_remote_code=True
-    )
-    
-    print("✅ Local LLM loaded successfully!")
-    print(f"   Model: {model_name}")
-    print(f"   Device: {model.device}")
-    print(f"   Memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
-    
-except Exception as e:
-    print(f"❌ Failed to load LLM: {e}")
-    sys.exit("LLM loading failed.")
+# Reuse previously loaded model/tokenizer if available (prevents re-loading in same process)
+model = globals().get('model', None)
+tokenizer = globals().get('tokenizer', None)
+
+if model is not None and tokenizer is not None:
+    print("🔁 LLM already loaded in memory; reusing existing instance.")
+else:
+    try:
+        # Use Transformers' built-in caching; if files exist, they won't re-download
+        print("📦 Using HuggingFace cache if available...")
+        
+        # Load tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        
+        # Prefer 4-bit quantization with auto device map; fallback to 8-bit with CPU offload; then CPU
+        model = None
+        if torch.cuda.is_available():
+            try:
+                quant_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.float16,
+                )
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    quantization_config=quant_config,
+                    device_map="auto",
+                    trust_remote_code=True,
+                )
+            except Exception as e1:
+                try:
+                    model = AutoModelForCausalLM.from_pretrained(
+                        model_name,
+                        load_in_8bit=True,
+                        llm_int8_enable_fp32_cpu_offload=True,
+                        device_map="auto",
+                        trust_remote_code=True,
+                    )
+                except Exception as e2:
+                    model = AutoModelForCausalLM.from_pretrained(
+                        model_name,
+                        torch_dtype=torch.float32,
+                        device_map="cpu",
+                        trust_remote_code=True,
+                    )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float32,
+                device_map="cpu",
+                trust_remote_code=True,
+            )
+
+        print("✅ Local LLM loaded successfully!")
+        print(f"   Model: {model_name}")
+        if torch.cuda.is_available():
+            try:
+                print(f"   CUDA: {torch.cuda.get_device_name(0)} • {torch.cuda.memory_allocated() / 1024**3:.2f} GB allocated")
+            except Exception:
+                pass
+        else:
+            print("   CUDA: not available; using CPU/offload")
+        
+    except Exception as e:
+        print(f"❌ Failed to load LLM: {e}")
+        # Graceful degrade: continue without LLM (single-voice mode)
+        model = None
+        tokenizer = None
+        print("⚠️ LLM disabled. Server will run in single-voice mode without analysis.")
 
 # ========================================
 # STEP 3: Download Piper Voice Models
 # ========================================
-print("\n🎤 Downloading Piper voice models...")
+print("\n🎤 Setting up Piper voice models...")
 os.makedirs("/content/piper_models", exist_ok=True)
 
 # Base narrator voice
-!wget -q -O /content/piper_models/en_US-lessac-medium.onnx \
-  https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx
-!wget -q -O /content/piper_models/en_US-lessac-medium.onnx.json \
-  https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json
+base_model = "/content/piper_models/en_US-lessac-medium.onnx"
+base_config = "/content/piper_models/en_US-lessac-medium.onnx.json"
+
+if os.path.exists(base_model) and os.path.exists(base_config):
+    print("✅ Base voice model already exists, skipping download")
+else:
+    print("Downloading base voice model...")
+    !wget -q -O /content/piper_models/en_US-lessac-medium.onnx \
+      https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx
+    !wget -q -O /content/piper_models/en_US-lessac-medium.onnx.json \
+      https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json
+    print("✅ Base voice model downloaded")
 
 print("\n🎭 Downloading additional voice models...")
 
@@ -113,6 +181,7 @@ for model_name_voice, path in voice_models:
     config_file = f"/content/piper_models/{model_name_voice}.onnx.json"
     
     if os.path.exists(model_file) and os.path.exists(config_file):
+        downloaded_count += 1
         continue
     
     try:
@@ -282,6 +351,10 @@ def analyze_chunk_with_llm(chunk_text, chunk_index, total_chunks, registry):
     Analyze a single chunk with LLM.
     Returns: (characters, dialogues, chunk_index)
     """
+    # If LLM isn't available, skip and return no analysis
+    if 'model' not in globals() or model is None or 'tokenizer' not in globals() or tokenizer is None:
+        return ([], [], chunk_index)
+
     print(f"   🔍 Analyzing chunk {chunk_index + 1}/{total_chunks} ({len(chunk_text)} chars)...")
     
     try:
@@ -927,17 +1000,22 @@ def stream():
 def run_flask():
     app.run(host='0.0.0.0', port=5001, debug=False, use_reloader=False)
 
-def start_tunnel_and_get_url():
+def start_cloudflare_tunnel():
+    """Start Cloudflare tunnel and return the process and URL"""
     print("\n🌐 Starting Cloudflare Tunnel...")
     
     if not os.path.exists("/usr/local/bin/cloudflared"):
         print("❌ Cloudflare executable not found")
-        return
+        print("Installing cloudflared...")
+        subprocess.run("wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb", shell=True)
+        subprocess.run("dpkg -i cloudflared-linux-amd64.deb", shell=True)
+        if not os.path.exists("/usr/local/bin/cloudflared"):
+            return None, None
     
     tunnel_cmd = ["cloudflared", "tunnel", "--url", "http://localhost:5001", "--metrics", "localhost:4040"]
     tunnel_process = subprocess.Popen(tunnel_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
-    print("⏳ Waiting for tunnel...")
+    print("⏳ Waiting for Cloudflare tunnel...")
     time.sleep(5)
     
     public_url = None
@@ -947,49 +1025,133 @@ def start_tunnel_and_get_url():
             response.raise_for_status()
             data = response.json()
             public_url = data['hostname']
+            if public_url:
+                public_url = f"https://{public_url}"
             break
         except:
             print(f"   ...retrying ({i+1}/5)")
             time.sleep(2)
     
     if public_url:
+        return tunnel_process, public_url
+    else:
+        if tunnel_process:
+            tunnel_process.kill()
+        return None, None
+
+def start_playit_tunnel():
+    """Start playit.gg tunnel and return the process and URL"""
+    print("\n🎮 Starting playit.gg Tunnel...")
+    
+    # Download playit if not present
+    playit_path = "/usr/local/bin/playit"
+    
+    if os.path.exists(playit_path):
+        print("✅ Playit already installed, skipping download")
+    else:
+        print("Installing playit...")
+        subprocess.run("wget -O /usr/local/bin/playit https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-linux-x86_64", shell=True)
+        subprocess.run("chmod +x /usr/local/bin/playit", shell=True)
+        if not os.path.exists(playit_path):
+            print("❌ Failed to install playit")
+            return None, None
+        print("✅ Playit installed successfully")
+    
+    # Start playit tunnel
+    tunnel_cmd = [playit_path]
+    tunnel_process = subprocess.Popen(tunnel_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    
+    print("⏳ Starting playit agent...")
+    time.sleep(3)
+    
+    print("\n" + "="*70)
+    print("📝 PLAYIT.GG SETUP INSTRUCTIONS:")
+    print("="*70)
+    print("1. The playit agent is running")
+    print("2. Check the output above for a claim URL")
+    print("3. Visit the URL to claim your agent")
+    print("4. Create a TCP tunnel for port 5001")
+    print("5. Get your tunnel URL (e.g., xxxxx.playit.gg:12345)")
+    print("6. Use http://xxxxx.playit.gg:12345 in your Android app")
+    print("="*70)
+    print("\n⚠️ NOTE: Playit requires manual configuration")
+    
+    # For playit, we can't automatically get the URL
+    return tunnel_process, "CHECK_PLAYIT_DASHBOARD"
+
+def start_tunnel_and_get_url(tunnel_choice="auto"):
+    """Start tunnel based on choice: 'cloudflare', 'playit', or 'auto'"""
+    
+    tunnel_process = None
+    public_url = None
+    tunnel_type = "Unknown"
+    
+    if tunnel_choice == "auto":
+        # Try Cloudflare first, then playit
+        print("\n🔄 Auto-selecting tunnel provider...")
+        tunnel_process, public_url = start_cloudflare_tunnel()
+        if public_url and public_url != "CHECK_PLAYIT_DASHBOARD":
+            tunnel_type = "Cloudflare"
+        else:
+            print("\n⚠️ Cloudflare failed, trying playit.gg...")
+            tunnel_process, public_url = start_playit_tunnel()
+            tunnel_type = "playit.gg"
+    elif tunnel_choice == "cloudflare":
+        tunnel_process, public_url = start_cloudflare_tunnel()
+        tunnel_type = "Cloudflare"
+    elif tunnel_choice == "playit":
+        tunnel_process, public_url = start_playit_tunnel()
+        tunnel_type = "playit.gg"
+    else:
+        print(f"❌ Invalid tunnel choice: {tunnel_choice}")
+        return
+    
+    if public_url:
         print("\n" + "="*70)
-        print("🎉 PARALLEL PIPELINE TTS SERVER IS LIVE!")
+        print(f"🎉 TTS SERVER IS LIVE via {tunnel_type}!")
         print("="*70)
-        print(f"\n⚠️  COPY THIS URL TO YOUR APP:")
-        print(f"➡️   https://{public_url}")
+        
+        if public_url == "CHECK_PLAYIT_DASHBOARD":
+            print("\n⚠️  IMPORTANT: Get your URL from playit.gg")
+            print("   1. Check the claim URL printed above")
+            print("   2. Sign in and claim your agent")
+            print("   3. Create a TCP tunnel for port 5001")
+            print("   4. Get your tunnel URL from the dashboard")
+            print("   5. Use http://xxxxx.playit.gg:port in your app")
+        else:
+            print(f"\n⚠️  COPY THIS URL TO YOUR APP:")
+            print(f"➡️   {public_url}")
+        
         print("="*70 + "\n")
-        print("✨ Advanced Features:")
-        print("  ✅ Parallel LLM Analysis - Multiple chunks analyzed simultaneously")
-        print("  ✅ Unlimited Text Length - Intelligent chunking with overlap")
-        print("  ✅ Speaker Consistency - Global character registry across chunks")
-        print("  ✅ Context Preservation - 300-char overlap maintains speaker context")
-        print("  ✅ Pipeline Optimization - Analysis and synthesis happen in parallel")
-        print("  ✅ Multi-voice Synthesis - Gender & age-based voice assignment")
-        print("  ✅ No API Keys Required - 100% local inference")
-        print("\n📊 System Status:")
-        print(f"  🤖 LLM Model: Qwen/Qwen2.5-7B-Instruct")
+        print("✨ Server Features:")
+        print("  ✅ Multi-speaker detection with LLM")
+        print("  ✅ Real-time streaming via /stream")
+        print("  ✅ Full conversion via /convert")
+        print("  ✅ Raw PCM output for Android AudioTrack")
+        print("  ✅ Word-level timestamps with Whisper")
+        print("\n🌐 Tunnel Options:")
+        print(f"  • Current: {tunnel_type}")
+        print("  • Cloudflare: Zero-config, automatic URL")
+        print("  • playit.gg: More stable, requires dashboard setup")
+        print("\n📊 System Info:")
+        print(f"  🤖 LLM: Qwen/Qwen2.5-7B-Instruct")
         print(f"  🎮 GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
-        print(f"  💾 GPU Memory: {torch.cuda.memory_allocated() / 1024**3:.2f} GB allocated")
-        print(f"  🔥 Max Workers: 2 parallel LLM threads")
-        print(f"  📏 Chunk Size: 6000 chars with 300-char overlap")
-        print("\n⚡ Performance Tips:")
-        print("  • Longer texts = better parallelization efficiency")
-        print("  • First request may be slower (model warm-up)")
-        print("  • Upgrade to A100 GPU for faster processing")
-        print("\n🔒 Keep this cell running to maintain the server!")
+        print(f"  💾 Memory: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+        print("\n🔒 Keep this running to maintain the server!")
         print("="*70 + "\n")
     else:
         print("\n❌ TUNNEL FAILED")
-        tunnel_process.kill()
+        if tunnel_process:
+            tunnel_process.kill()
         return
     
-    try:
-        tunnel_process.wait()
-    except KeyboardInterrupt:
-        print("\n🛑 Shutting down...")
-        tunnel_process.kill()
-        print("✅ Server stopped")
+    if tunnel_process:
+        try:
+            tunnel_process.wait()
+        except KeyboardInterrupt:
+            print("\n🛑 Shutting down...")
+            tunnel_process.kill()
+            print("✅ Server stopped")
 
 # Kill existing processes
 print("\n🔪 Cleaning up port 5001...")
@@ -1008,5 +1170,15 @@ flask_thread.start()
 # Wait for Flask to start
 time.sleep(3)
 
+# ========================================
+# TUNNEL SELECTION
+# ========================================
+# Choose your tunnel provider:
+# - "cloudflare" : Automatic URL generation, zero-config (recommended for Colab)
+# - "playit"     : More stable, requires manual dashboard setup (good for VPS)
+# - "auto"       : Try Cloudflare first, fallback to playit
+
+TUNNEL_CHOICE = "auto"  # Change to "cloudflare" or "playit" as needed
+
 # Start tunnel
-start_tunnel_and_get_url()
+start_tunnel_and_get_url(TUNNEL_CHOICE)

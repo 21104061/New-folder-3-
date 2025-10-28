@@ -57,113 +57,118 @@ class ConversionWorker(
             // Start conversion
             setForeground(createForegroundInfo(title, "Converting to audio..."))
 
-            val response = ServerAPI.convertBookRaw(
+            ServerAPI.convertBookRaw(
                 title = title,
                 text = text,
                 serverUrl = serverUrl
-            )
+            ).use { response ->
+                if (!response.isSuccessful) {
+                    val errorBody = response.body?.string() ?: "Unknown error"
+                    bookManager.updateBookStatus(bookId, BookStatus.ERROR)
+                    
+                    showErrorNotification(title, "Conversion failed: $errorBody")
+                    return@withContext Result.failure(
+                        workDataOf("error" to errorBody)
+                    )
+                }
 
-            if (!response.isSuccessful) {
-                val errorBody = response.body?.string() ?: "Unknown error"
-                bookManager.updateBookStatus(bookId, BookStatus.ERROR)
+                // Update status to DOWNLOADING
+                bookManager.updateBookStatus(bookId, BookStatus.DOWNLOADING)
+                setForeground(createForegroundInfo(title, "Downloading..."))
+
+                // Save the ZIP file
+                val bookDir = bookManager.createBookDirectory(bookId)
+                val zipFile = File(bookDir, "download.zip")
                 
-                showErrorNotification(title, "Conversion failed: $errorBody")
-                return@withContext Result.failure(
-                    workDataOf("error" to errorBody)
-                )
-            }
-
-            // Update status to DOWNLOADING
-            bookManager.updateBookStatus(bookId, BookStatus.DOWNLOADING)
-            setForeground(createForegroundInfo(title, "Downloading..."))
-
-            // Save the ZIP file
-            val bookDir = bookManager.createBookDirectory(bookId)
-            val zipFile = File(bookDir, "download.zip")
-            
-            response.body?.byteStream()?.use { input ->
-                FileOutputStream(zipFile).use { output ->
-                    input.copyTo(output)
-                }
-            }
-
-            // Extract files
-            setForeground(createForegroundInfo(title, "Extracting files..."))
-
-            var audioPath = ""
-            var timestampsPath = ""
-            var textPath = ""
-
-            ZipInputStream(zipFile.inputStream()).use { zipInput ->
-                var entry = zipInput.nextEntry
-                while (entry != null) {
-                    val file = File(bookDir, entry.name)
-
-                    if (!entry.isDirectory) {
-                        FileOutputStream(file).use { output ->
-                            zipInput.copyTo(output)
-                        }
-
-                        when (entry.name) {
-                            "final_audio.mp3" -> audioPath = file.absolutePath
-                            "timestamps.json" -> timestampsPath = file.absolutePath
-                            "book_text.txt" -> textPath = file.absolutePath
-                        }
+                response.body?.byteStream()?.use { input ->
+                    FileOutputStream(zipFile).use { output ->
+                        input.copyTo(output)
                     }
-
-                    zipInput.closeEntry()
-                    entry = zipInput.nextEntry
                 }
-            }
 
-            // Delete zip file
-            zipFile.delete()
+                // Extract files
+                setForeground(createForegroundInfo(title, "Extracting files..."))
 
-            if (audioPath.isEmpty() || textPath.isEmpty()) {
-                bookManager.updateBookStatus(bookId, BookStatus.ERROR)
-                showErrorNotification(title, "Downloaded file is incomplete")
-                return@withContext Result.failure(
-                    workDataOf("error" to "Incomplete download")
+                var audioPath = ""
+                var timestampsPath = ""
+                var textPath = ""
+                var audioFileSize = 0L
+
+                ZipInputStream(zipFile.inputStream()).use { zipInput ->
+                    var entry = zipInput.nextEntry
+                    while (entry != null) {
+                        val file = File(bookDir, entry.name)
+
+                        if (!entry.isDirectory) {
+                            FileOutputStream(file).use { output ->
+                                zipInput.copyTo(output)
+                            }
+
+                            when (entry.name) {
+                                "final_audio.mp3" -> {
+                                    audioPath = file.absolutePath
+                                    audioFileSize = file.length()
+                                }
+                                "timestamps.json" -> timestampsPath = file.absolutePath
+                                "book_text.txt" -> textPath = file.absolutePath
+                            }
+                        }
+
+                        zipInput.closeEntry()
+                        entry = zipInput.nextEntry
+                    }
+                }
+
+                // Delete zip file
+                zipFile.delete()
+
+                if (audioPath.isEmpty() || textPath.isEmpty()) {
+                    bookManager.updateBookStatus(bookId, BookStatus.ERROR)
+                    showErrorNotification(title, "Downloaded file is incomplete")
+                    return@withContext Result.failure(
+                        workDataOf("error" to "Incomplete download")
+                    )
+                }
+
+                // Get audio duration
+                val timestamps = if (File(timestampsPath).exists()) {
+                    val json = File(timestampsPath).readText()
+                    Json.decodeFromString<List<WordTimestamp>>(json)
+                } else {
+                    emptyList()
+                }
+                
+                val durationSeconds = timestamps.lastOrNull()?.end?.toInt() ?: 0
+                val durationFormatted = formatDuration(durationSeconds)
+
+                // Create final Book object with READY status
+                val finalBook = Book(
+                    id = bookId,
+                    title = title,
+                    audioPath = audioPath,
+                    timestampsPath = timestampsPath,
+                    textPath = textPath,
+                    wordCount = wordCount,
+                    duration = durationFormatted,
+                    status = BookStatus.READY,
+                    fileSize = audioFileSize
                 )
+
+                // Update book in metadata
+                val currentBooks = bookManager.getBooks().toMutableList()
+                val index = currentBooks.indexOfFirst { it.id == bookId }
+                if (index != -1) {
+                    currentBooks[index] = finalBook
+                    val metadataFile = File(applicationContext.filesDir, "books_metadata.json")
+                    val jsonString = Json.encodeToString(currentBooks)
+                    metadataFile.writeText(jsonString)
+                }
+
+                // Show success notification
+                showSuccessNotification(title)
+
+                return@withContext Result.success()
             }
-
-            // Get audio duration
-            val timestamps = if (File(timestampsPath).exists()) {
-                val json = File(timestampsPath).readText()
-                Json.decodeFromString<List<WordTimestamp>>(json)
-            } else {
-                emptyList()
-            }
-            
-            val durationSeconds = timestamps.lastOrNull()?.end?.toInt() ?: 0
-            val durationFormatted = formatDuration(durationSeconds)
-
-            // Create final Book object with READY status
-            val finalBook = Book(
-                id = bookId,
-                title = title,
-                audioPath = audioPath,
-                timestampsPath = timestampsPath,
-                textPath = textPath,
-                wordCount = wordCount,
-                duration = durationFormatted,
-                status = BookStatus.READY
-            )
-
-            // Update book in metadata
-            val currentBooks = bookManager.getBooks().toMutableList()
-            val index = currentBooks.indexOfFirst { it.id == bookId }
-            if (index != -1) {
-                currentBooks[index] = finalBook
-                val metadataFile = File(applicationContext.filesDir, "books_metadata.json")
-                val jsonString = Json.encodeToString(currentBooks)
-                metadataFile.writeText(jsonString)
-            }
-
-            // Show success notification
-            showSuccessNotification(title)
-
-            Result.success()
 
         } catch (e: Exception) {
             e.printStackTrace()

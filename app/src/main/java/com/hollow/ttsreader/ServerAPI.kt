@@ -34,156 +34,13 @@ object ServerAPI {
 
     private val client = OkHttpClient.Builder()
         .addInterceptor(loggingInterceptor)
-        .connectTimeout(5, java.util.concurrent.TimeUnit.MINUTES)
-        .readTimeout(10, java.util.concurrent.TimeUnit.MINUTES)
-        .writeTimeout(5, java.util.concurrent.TimeUnit.MINUTES)
+        .retryOnConnectionFailure(true)
+        .connectTimeout(2, java.util.concurrent.TimeUnit.MINUTES)
+        .readTimeout(60, java.util.concurrent.TimeUnit.MINUTES)
+        .writeTimeout(60, java.util.concurrent.TimeUnit.MINUTES)
         .build()
 
     private val json = Json { ignoreUnknownKeys = true }
-
-    suspend fun convertBook(
-        title: String,
-        text: String,
-        context: Context,
-        serverUrl: String, // <-- ADDED PARAMETER
-        onProgress: (String) -> Unit
-    ): Book = withContext(Dispatchers.IO) {
-
-        // Create JSON payload
-        val jsonPayload = buildJsonObject {
-            put("title", title)
-            put("text", text)
-        }.toString()
-
-        val requestBody = jsonPayload.toRequestBody("application/json".toMediaType())
-
-        val request = Request.Builder()
-            .url("$serverUrl/convert") // <-- USE THE PARAMETER
-            .post(requestBody)
-            .build()
-
-        onProgress("Uploading to server...")
-
-        val response = client.newCall(request).execute()
-
-        if (!response.isSuccessful) {
-            val errorBody = response.body?.string() ?: "Unknown error"
-            
-            // Try to parse JSON error response
-            try {
-                val errorJson = json.decodeFromString<Map<String, String>>(errorBody)
-                val errorMsg = errorJson["error"] ?: errorBody
-                val segment = errorJson["segment"] ?: ""
-                val speaker = errorJson["speaker"] ?: ""
-                
-                val detailedError = if (segment.isNotEmpty() && speaker.isNotEmpty()) {
-                    "Failed at segment $segment ($speaker): $errorMsg"
-                } else {
-                    errorMsg
-                }
-                
-                throw Exception(detailedError)
-            } catch (e: Exception) {
-                // If JSON parsing fails, use raw error body
-                throw Exception("Server error ${response.code}: $errorBody")
-            }
-        }
-
-        onProgress("Downloading converted files...")
-
-        // Save the ZIP file
-        val bookId = UUID.randomUUID().toString()
-        val bookManager = BookManager(context)
-        val bookDir = bookManager.createBookDirectory(bookId)
-
-        val zipFile = File(bookDir, "download.zip")
-        response.body?.byteStream()?.use { input ->
-            FileOutputStream(zipFile).use { output ->
-                input.copyTo(output)
-            }
-        }
-
-        onProgress("Extracting files...")
-
-        // Unzip the files
-        var audioPath = ""
-        var timestampsPath = ""
-        var textPath = ""
-
-        ZipInputStream(zipFile.inputStream()).use { zipInput ->
-            var entry = zipInput.nextEntry
-            while (entry != null) {
-                val file = File(bookDir, entry.name)
-
-                if (!entry.isDirectory) {
-                    FileOutputStream(file).use { output ->
-                        zipInput.copyTo(output)
-                    }
-
-                    when (entry.name) {
-                        "final_audio.mp3" -> audioPath = file.absolutePath
-                        "timestamps.json" -> timestampsPath = file.absolutePath
-                        "book_text.txt" -> textPath = file.absolutePath
-                    }
-                }
-
-                zipInput.closeEntry()
-                entry = zipInput.nextEntry
-            }
-        }
-
-        // Delete zip file
-        zipFile.delete()
-
-        if (audioPath.isEmpty() || timestampsPath.isEmpty() || textPath.isEmpty()) {
-            throw Exception("Conversion failed: Zip file did not contain all required files.")
-        }
-
-        onProgress("Finalizing...")
-
-        // Calculate metadata
-        val bookText = File(textPath).readText()
-        val wordCount = bookText.split(Regex("\\s+")).size
-
-        // Get audio duration from timestamps
-        val timestamps = json.decodeFromString<List<WordTimestamp>>(
-            File(timestampsPath).readText()
-        )
-        val durationSeconds = timestamps.lastOrNull()?.end?.toInt() ?: 0
-        val durationFormatted = formatDuration(durationSeconds)
-
-        // Create Book object
-        Book(
-            id = bookId,
-            title = title,
-            audioPath = audioPath,
-            timestampsPath = timestampsPath,
-            textPath = textPath,
-            wordCount = wordCount,
-            duration = durationFormatted
-        )
-    }
-
-    suspend fun convertBookRaw(
-        title: String,
-        text: String,
-        serverUrl: String
-    ): Response = withContext(Dispatchers.IO) {
-        // Create JSON payload
-        val jsonPayload = buildJsonObject {
-            put("title", title)
-            put("text", text)
-        }.toString()
-
-        val requestBody = jsonPayload.toRequestBody("application/json".toMediaType())
-
-        val request = Request.Builder()
-            .url("$serverUrl/convert")
-            .post(requestBody)
-            .build()
-
-        client.newCall(request).execute()
-    }
 
     suspend fun streamAudio(
         text: String,
@@ -280,5 +137,25 @@ object ServerAPI {
         } catch (e: Exception) {
             false
         }
+    }
+
+    suspend fun convertBookRaw(
+        title: String,
+        text: String,
+        serverUrl: String
+    ): Response = withContext(Dispatchers.IO) {
+        val jsonPayload = buildJsonObject {
+            put("text", text)
+            put("title", title)
+        }.toString()
+
+        val requestBody = jsonPayload.toRequestBody("application/json".toMediaType())
+
+        val request = Request.Builder()
+            .url("$serverUrl/convert")
+            .post(requestBody)
+            .build()
+
+        return@withContext client.newCall(request).execute()
     }
 }

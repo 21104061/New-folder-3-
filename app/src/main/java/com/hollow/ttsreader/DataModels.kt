@@ -18,7 +18,9 @@ data class Book(
     val wordCount: Int,
     val duration: String,
     val dateAdded: Long = System.currentTimeMillis(),
-    val status: BookStatus = BookStatus.READY // NEW FIELD
+    val status: BookStatus = BookStatus.READY,
+    val fileSize: Long = 0L,
+    val lastUpdated: Long = System.currentTimeMillis()
 ) {
     fun getText(): String {
         return File(textPath).readText()
@@ -109,7 +111,10 @@ class BookManager(private val context: Context) {
         val index = currentBooks.indexOfFirst { it.id == bookId }
         
         if (index != -1) {
-            currentBooks[index] = currentBooks[index].copy(status = status)
+            currentBooks[index] = currentBooks[index].copy(
+                status = status,
+                lastUpdated = System.currentTimeMillis()
+            )
             val jsonString = Json.encodeToString(currentBooks)
             metadataFile.writeText(jsonString)
         }
@@ -117,5 +122,20 @@ class BookManager(private val context: Context) {
 
     fun getBook(bookId: String): Book? {
         return getBooks().find { it.id == bookId }
+    }
+
+    fun cleanupStaleBooks(maxAgeMillis: Long = 2 * 60 * 60 * 1000): List<Book> {
+        val now = System.currentTimeMillis()
+        val books = getBooks().toMutableList()
+        val toDelete = books.filter {
+            (it.status == BookStatus.CONVERTING || it.status == BookStatus.DOWNLOADING) &&
+            (now - it.lastUpdated) > maxAgeMillis
+        }
+
+        if (toDelete.isNotEmpty()) {
+            toDelete.forEach { deleteBook(it.id) }
+        }
+        
+        return toDelete
     }
 }

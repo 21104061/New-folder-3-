@@ -32,12 +32,26 @@ import com.hollow.ttsreader.TTSReaderTheme
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
-import java.util.UUID
+import java.text.SimpleDateFormat
+import java.util.*
 // --- IMPORTS END HERE ---
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            val granted = androidx.core.content.ContextCompat.checkSelfPermission(
+                this,
+                android.Manifest.permission.POST_NOTIFICATIONS
+            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            if (!granted) {
+                androidx.core.app.ActivityCompat.requestPermissions(
+                    this,
+                    arrayOf(android.Manifest.permission.POST_NOTIFICATIONS),
+                    1001
+                )
+            }
+        }
         setContent {
             TTSReaderTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
@@ -120,6 +134,7 @@ fun TTSReaderApp() {
             when (val screen = currentScreen) {
                 Screen.Library -> {
                     LibraryScreen(
+                        bookManager = bookManager,
                         books = books,
                         onBookClick = { book ->
                             selectedBook = book
@@ -293,6 +308,13 @@ fun UploadScreen(
                             
                             scope.launch {
                                 try {
+                                    // Validate server URL
+                                    val serverUrl = appPrefs.serverUrl
+                                    if (serverUrl.isBlank() || !serverUrl.startsWith("http")) {
+                                        showError = true
+                                        errorMessage = "Invalid server URL. Please set it in Settings."
+                                        return@launch
+                                    }
                                     // Create book immediately with CONVERTING status
                                     val bookId = UUID.randomUUID().toString()
                                     val bookManager = BookManager(context)
@@ -322,6 +344,11 @@ fun UploadScreen(
                                     
                                     // Schedule background conversion
                                     val workRequest = OneTimeWorkRequestBuilder<ConversionWorker>()
+                                        .setConstraints(
+                                            androidx.work.Constraints.Builder()
+                                                .setRequiredNetworkType(androidx.work.NetworkType.CONNECTED)
+                                                .build()
+                                        )
                                         .setInputData(
                                             workDataOf(
                                                 ConversionWorker.KEY_BOOK_ID to bookId,
@@ -358,69 +385,177 @@ fun UploadScreen(
 
 @Composable
 fun LibraryScreen(
+    bookManager: BookManager, 
     books: List<Book>,
     onBookClick: (Book) -> Unit,
     onRefresh: () -> Unit
 ) {
-    // Auto-refresh every 2 seconds if there are converting books
+    var deletedBooks by remember { mutableStateOf<List<Book>>(emptyList()) }
+    var selectionMode by remember { mutableStateOf(false) }
+    var selectedIds by remember { mutableStateOf(setOf<String>()) }
+
     val hasConvertingBooks = books.any { 
         it.status == BookStatus.CONVERTING || it.status == BookStatus.DOWNLOADING 
+    }
+
+    LaunchedEffect(Unit) {
+        deletedBooks = bookManager.cleanupStaleBooks()
+        onRefresh()
     }
     
     LaunchedEffect(hasConvertingBooks) {
         if (hasConvertingBooks) {
             while (true) {
-                delay(2000) // Refresh every 2 seconds
+                delay(2000)
                 onRefresh()
             }
         }
     }
-    
-    LaunchedEffect(Unit) {
-        onRefresh()
-    }
 
-    if (books.isEmpty()) {
-        Box(
-            modifier = Modifier.fillMaxSize(),
-            contentAlignment = Alignment.Center
-        ) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Icon(
-                    Icons.Default.MenuBook,
-                    contentDescription = null,
-                    modifier = Modifier.size(64.dp),
-                    tint = MaterialTheme.colorScheme.primary
-                )
-                Spacer(modifier = Modifier.height(16.dp))
-                Text("No books yet", style = MaterialTheme.typography.titleLarge)
-                Text("Tap + to convert your first book")
-            }
+    Column(modifier = Modifier.fillMaxSize()) {
+        if (deletedBooks.isNotEmpty()) {
+            DeletedBooksReport(deletedBooks) { deletedBooks = emptyList() }
         }
-    } else {
-        LazyColumn(
-            modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            items(books) { book ->
-                BookCard(
-                    book = book,
+            AssistChip(
+                onClick = { selectionMode = !selectionMode; if (!selectionMode) selectedIds = emptySet() },
+                label = { Text(if (selectionMode) "Done Selecting" else "Select") },
+                leadingIcon = { Icon(Icons.Default.Checklist, contentDescription = null) }
+            )
+            if (books.isNotEmpty()) {
+                AssistChip(
                     onClick = {
-                        if (book.status == BookStatus.READY) {
-                            onBookClick(book)
-                        }
-                    }
+                        selectionMode = true
+                        selectedIds = books.map { it.id }.toSet()
+                    },
+                    label = { Text("Select All") },
+                    leadingIcon = { Icon(Icons.Default.SelectAll, contentDescription = null) }
                 )
+            }
+            val canDelete = selectedIds.isNotEmpty()
+            AssistChip(
+                onClick = {
+                    if (canDelete) {
+                        selectedIds.forEach { bookManager.deleteBook(it) }
+                        selectedIds = emptySet()
+                        selectionMode = false
+                        onRefresh()
+                    }
+                },
+                enabled = canDelete,
+                label = { Text("Delete Selected") },
+                leadingIcon = { Icon(Icons.Default.Delete, contentDescription = null) }
+            )
+        }
+
+        if (books.isEmpty()) {
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(
+                        Icons.Default.MenuBook,
+                        contentDescription = null,
+                        modifier = Modifier.size(64.dp),
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text("No books yet", style = MaterialTheme.typography.titleLarge)
+                    Text("Tap + to convert your first book")
+                }
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                items(books) { book ->
+                    val selected = selectedIds.contains(book.id)
+                    BookCard(
+                        book = book,
+                        onClick = {
+                            if (book.status == BookStatus.READY) {
+                                onBookClick(book)
+                            }
+                        },
+                        showCheckbox = selectionMode,
+                        selected = selected,
+                        onSelectToggle = {
+                            selectedIds = if (selected) selectedIds - book.id else selectedIds + book.id
+                        },
+                        onDelete = {
+                            bookManager.deleteBook(book.id)
+                            onRefresh()
+                        }
+                    )
+                }
             }
         }
     }
 }
 
 @Composable
-fun BookCard(book: Book, onClick: () -> Unit) {
+fun DeletedBooksReport(deletedBooks: List<Book>, onDismiss: () -> Unit) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(16.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.errorContainer
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.onErrorContainer)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Cleanup Report", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onErrorContainer)
+                Spacer(modifier = Modifier.weight(1f))
+                IconButton(onClick = onDismiss) {
+                    Icon(Icons.Default.Close, contentDescription = "Dismiss")
+                }
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            Text("The following books were deleted because they were converting for more than 2 hours:", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onErrorContainer)
+            Spacer(modifier = Modifier.height(8.dp))
+            deletedBooks.forEach {
+                Text("- ${it.title}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onErrorContainer)
+            }
+        }
+    }
+}
+
+fun formatFileSize(size: Long): String {
+    if (size <= 0) return "0 B"
+    val units = arrayOf("B", "KB", "MB", "GB", "TB")
+    val digitGroups = (Math.log10(size.toDouble()) / Math.log10(1024.0)).toInt()
+    return "%.1f %s".format(size / Math.pow(1024.0, digitGroups.toDouble()), units[digitGroups])
+}
+
+fun formatDate(timestamp: Long): String {
+    val sdf = SimpleDateFormat("MMM d, yyyy - h:mm a", Locale.getDefault())
+    return sdf.format(Date(timestamp))
+}
+
+@Composable
+fun BookCard(
+    book: Book,
+    onClick: () -> Unit,
+    showCheckbox: Boolean,
+    selected: Boolean,
+    onSelectToggle: () -> Unit,
+    onDelete: () -> Unit
+) {
     val isClickable = book.status == BookStatus.READY
-    
     Card(
         modifier = Modifier
             .fillMaxWidth()
@@ -428,12 +563,9 @@ fun BookCard(book: Book, onClick: () -> Unit) {
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
         colors = CardDefaults.cardColors(
             containerColor = when (book.status) {
-                BookStatus.CONVERTING, BookStatus.DOWNLOADING -> 
-                    MaterialTheme.colorScheme.surfaceVariant
-                BookStatus.ERROR -> 
-                    MaterialTheme.colorScheme.errorContainer
-                else -> 
-                    MaterialTheme.colorScheme.surface
+                BookStatus.CONVERTING, BookStatus.DOWNLOADING -> MaterialTheme.colorScheme.surfaceVariant
+                BookStatus.ERROR -> MaterialTheme.colorScheme.errorContainer
+                else -> MaterialTheme.colorScheme.surface
             }
         )
     ) {
@@ -443,7 +575,10 @@ fun BookCard(book: Book, onClick: () -> Unit) {
                 .fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Icon based on status
+            if (showCheckbox) {
+                Checkbox(checked = selected, onCheckedChange = { onSelectToggle() })
+                Spacer(modifier = Modifier.width(8.dp))
+            }
             when (book.status) {
                 BookStatus.CONVERTING, BookStatus.DOWNLOADING -> {
                     CircularProgressIndicator(
@@ -468,9 +603,7 @@ fun BookCard(book: Book, onClick: () -> Unit) {
                     )
                 }
             }
-            
             Spacer(modifier = Modifier.width(16.dp))
-            
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text = book.title,
@@ -478,15 +611,15 @@ fun BookCard(book: Book, onClick: () -> Unit) {
                     fontWeight = FontWeight.SemiBold
                 )
                 Spacer(modifier = Modifier.height(4.dp))
-                
-                // Status text
                 val statusText = when (book.status) {
                     BookStatus.CONVERTING -> "Converting..."
                     BookStatus.DOWNLOADING -> "Downloading..."
                     BookStatus.ERROR -> "Conversion failed"
-                    BookStatus.READY -> "${book.wordCount} words • ${book.duration.ifBlank { "N/A" }}"
+                    BookStatus.READY -> {
+                        val fileSize = formatFileSize(book.fileSize)
+                        "${book.wordCount} words • ${book.duration.ifBlank { "N/A" }} • $fileSize"
+                    }
                 }
-                
                 Text(
                     text = statusText,
                     style = MaterialTheme.typography.bodySmall,
@@ -495,8 +628,16 @@ fun BookCard(book: Book, onClick: () -> Unit) {
                         else -> MaterialTheme.colorScheme.onSurfaceVariant
                     }
                 )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "Added: ${formatDate(book.dateAdded)}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
-            
+            IconButton(onClick = onDelete) {
+                Icon(Icons.Default.Delete, contentDescription = "Delete")
+            }
             if (isClickable) {
                 Icon(Icons.Default.ChevronRight, contentDescription = "Open Book")
             }
