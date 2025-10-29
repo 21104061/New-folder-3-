@@ -8,6 +8,7 @@ import threading
 import traceback
 import json
 import time
+import re
 from flask import stream_with_context
 import subprocess
 from queue import Queue
@@ -57,9 +58,9 @@ else:
     print("✅ Cloudflare installed successfully")
 
 # ========================================
-# STEP 2.5: Load Local LLM (gpt-oss-20b)
+# STEP 2.5: Load Local LLM
 # ========================================
-print("\n🤖 Loading gpt-oss-20b model...")
+print("\n🤖 Loading Qwenw2.5-7B model...")
 print("   Model size: ~13.8GB")
 
 # Load model and tokenizer
@@ -396,15 +397,27 @@ def analyze_chunk_with_llm(chunk_text, chunk_index, total_chunks, registry):
         # Decode
         response = tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
 
-        # Extract JSON
+        # **IMPROVEMENT**: Find and clean JSON
         json_start = response.find('{')
         json_end = response.rfind('}') + 1
 
         if json_start == -1 or json_end == 0:
-            raise ValueError("No JSON found in response")
+            raise ValueError("No JSON object found in LLM response")
 
         json_str = response[json_start:json_end]
-        result = json.loads(json_str)
+
+        # Clean common LLM errors
+        json_str = json_str.strip().strip("```json").strip("```") # Remove markdown
+        json_str = re.sub(r"\\'", "'", json_str) # Fix escaped single quotes
+        json_str = re.sub(r"\n", " ", json_str) # Remove newlines that break strings
+        json_str = re.sub(r",\s*([\]}])", r"\1", json_str) # Fix trailing commas
+
+        try:
+            result = json.loads(json_str)
+        except json.JSONDecodeError as e:
+            print(f"       ⚠️ JSON decode failed even after cleaning: {e}")
+            print(f"       FAILED_JSON: {json_str[:500]}") # Log first 500 chars
+            raise ValueError(f"No valid JSON after attempting fixes: {e}")
 
         if "characters" not in result or "dialogues" not in result:
             raise ValueError("Invalid JSON structure")
@@ -417,12 +430,13 @@ def analyze_chunk_with_llm(chunk_text, chunk_index, total_chunks, registry):
                 if dialogue["speaker_id"] == char["id"]:
                     dialogue["speaker_id"] = char_id
 
-        print(f"      ✅ Found {len(result['characters'])} chars, {len(result['dialogues'])} dialogues")
+        print(f"       Succeeded ✅ Found {len(result['characters'])} chars, {len(result['dialogues'])} dialogues")
 
         return (result["characters"], result["dialogues"], chunk_index)
 
     except Exception as e:
-        print(f"      ⚠️ Chunk {chunk_index + 1} analysis failed: {e}")
+        print(f"       Failed ❌ Chunk {chunk_index + 1} analysis failed: {e}")
+        traceback.print_exc() # Print full error for debugging
         return ([], [], chunk_index)
 
 def assign_voice_model(gender, age_group, speaker_id, used_voices):
@@ -437,7 +451,7 @@ def assign_voice_model(gender, age_group, speaker_id, used_voices):
         "female_adult": [
             "/content/piper_models/en_US-amy-medium.onnx",
             "/content/piper_models/en_GB-jenny_dioco-medium.onnx",
-            "/content/piper_models/en_GB-alba-medium.onnx"
+            "/content/piper_models/en_GB-alba-medium.onncolabnx"
         ],
         "male_teen": [
             "/content/piper_models/en_US-bryce-medium.onnx",
@@ -455,13 +469,22 @@ def assign_voice_model(gender, age_group, speaker_id, used_voices):
     }
 
     category = f"{gender}_{age_group}"
-    pool = voice_pools.get(category, voice_pools["unknown"])
+    # Fallback to unknown if category doesn't exist, then to narrator if unknown is empty
+    pool = voice_pools.get(category, voice_pools.get("unknown", voice_pools["narrator"]))
 
+    # Ensure pool is not empty
+    if not pool:
+        pool = voice_pools["narrator"]
+
+    # Try to find a unique voice first
     for voice in pool:
         if voice not in used_voices.values():
             return voice
 
-    return pool[0]
+    # **IMPROVEMENT**: Rotate through the pool if all unique voices are used
+    # This prevents defaulting to pool[0] every time
+    used_count = sum(1 for v in used_voices.values() if v in pool)
+    return pool[used_count % len(pool)]
 
 def build_segments_from_dialogues(text, all_dialogues):
     """Build segments with narration and dialogue."""
@@ -669,40 +692,40 @@ def process_conversion_async(job_id, clean_text, book_title):
     """Process conversion in background thread"""
     try:
         print(f"\n🚀 Starting async conversion for job {job_id}")
-        
+
         # Update job status
         with job_lock:
             active_jobs[job_id]['status'] = 'processing'
             active_jobs[job_id]['progress'] = 'Converting text to audio...'
-        
+
         # Setup paths
         job_dir = f"{WORK_DIR}/job_{job_id}"
         os.makedirs(job_dir, exist_ok=True)
-        
+
         text_file = f"{job_dir}/input.txt"
         audio_file = f"{job_dir}/final_audio.wav"
         mp3_file = f"{job_dir}/final_audio.mp3"
         timestamps_file = f"{job_dir}/timestamps.json"
         zip_file = f"{job_dir}/converted_book.zip"
-        
+
         # Cleanup existing files
         for f in [text_file, audio_file, mp3_file, timestamps_file, zip_file]:
             if os.path.exists(f):
                 os.remove(f)
-        
+
         with open(text_file, 'w', encoding='utf-8') as f:
             f.write(clean_text)
-        
+
         # Update progress
         with job_lock:
             active_jobs[job_id]['progress'] = 'Analyzing text with LLM...'
-        
+
         # Run the same conversion logic as before
         try:
             speaker_metadata, segments, multi_speaker_mode = parallel_analyze_and_synthesize(
                 clean_text, job_dir
             )
-            
+
             speakers_metadata_json = {
                 "mode": "multi_voice" if multi_speaker_mode else "single_voice",
                 "total_speakers": len(speaker_metadata),
@@ -721,7 +744,7 @@ def process_conversion_async(job_id, clean_text, book_title):
                 ],
                 "segments_count": len(segments)
             }
-            
+
         except Exception as e:
             print(f"   ⚠️ Pipeline failed for job {job_id}: {e}")
             # Fallback to single voice
@@ -749,83 +772,83 @@ def process_conversion_async(job_id, clean_text, book_title):
                 }],
                 "segments_count": 1
             }
-        
+
         # Update progress
         with job_lock:
             active_jobs[job_id]['progress'] = 'Generating audio...'
-        
+
         # Generate audio (same logic as before)
         if multi_speaker_mode:
             print(f"\n🎵 Generating multi-voice audio ({len(segments)} segments)...")
             segment_audio_files = []
-            
+
             for i, segment in enumerate(segments):
                 speaker_id = segment['speaker_id']
                 segment_text = segment['text']
-                
+
                 if not segment_text.strip():
                     continue
-                
+
                 voice_model = speaker_metadata[speaker_id]['voice_model']
                 segment_audio_file = f"{job_dir}/segment_{i:04d}.wav"
-                
+
                 if i % 10 == 0:
                     with job_lock:
                         active_jobs[job_id]['progress'] = f'Generating audio segment {i}/{len(segments)}...'
-                
+
                 success = generate_segment_audio(segment_text, voice_model, segment_audio_file)
-                
+
                 if not success:
                     success = generate_segment_audio(segment_text, PIPER_MODEL, segment_audio_file)
-                    
+
                     if not success:
                         raise Exception(f"Segment {i} generation failed")
-                
+
                 segment_audio_files.append(segment_audio_file)
-            
+
             print("\n🔗 Concatenating all segments...")
             with job_lock:
                 active_jobs[job_id]['progress'] = 'Combining audio segments...'
-            
+
             success = concatenate_audio_segments(segment_audio_files, audio_file)
-            
+
             if not success:
                 raise Exception("Audio concatenation failed")
-            
+
             # Cleanup segment files
             for seg_file in segment_audio_files:
                 if os.path.exists(seg_file):
                     os.remove(seg_file)
-            
+
         else:
             print("\n🎵 Generating single-voice audio...")
             piper_cmd = f"piper --model {PIPER_MODEL} --output_file {audio_file} < {text_file}"
             result = subprocess.run(piper_cmd, shell=True, capture_output=True)
-            
+
             if result.returncode != 0:
                 raise Exception("TTS generation failed")
-        
+
         # Convert to MP3
         with job_lock:
             active_jobs[job_id]['progress'] = 'Converting to MP3...'
-        
+
         subprocess.run(
             f"ffmpeg -i {audio_file} -codec:a libmp3lame -qscale:a 2 {mp3_file} -y",
             shell=True, capture_output=True
         )
-        
+
         if not os.path.exists(mp3_file):
             raise Exception("MP3 conversion failed")
-        
+
         # Generate timestamps
         with job_lock:
             active_jobs[job_id]['progress'] = 'Generating timestamps...'
-        
+
         try:
             audio_whisper = whisper.load_audio(mp3_file)
             whisper_model = whisper.load_model("base", device="cuda" if torch.cuda.is_available() else "cpu")
             result_whisper = whisper.transcribe(whisper_model, audio_whisper, language="en")
-            
+
             timestamps = []
             for segment in result_whisper.get('segments', []):
                 for word_info in segment.get('words', []):
@@ -834,28 +857,28 @@ def process_conversion_async(job_id, clean_text, book_title):
                         "start": round(word_info.get('start', 0.0), 3),
                         "end": round(word_info.get('end', 0.0), 3)
                     })
-            
+
             with open(timestamps_file, 'w', encoding='utf-8') as f:
                 json.dump(timestamps, f, indent=2)
-            
+
         except Exception as e:
             print(f"⚠️ Timestamps failed for job {job_id}: {e}")
-        
+
         # Package files
         with job_lock:
             active_jobs[job_id]['progress'] = 'Packaging files...'
-        
+
         speakers_metadata_file = f"{job_dir}/speakers_metadata.json"
         with open(speakers_metadata_file, 'w', encoding='utf-8') as f:
             json.dump(speakers_metadata_json, f, indent=2)
-        
+
         with zipfile.ZipFile(zip_file, 'w', zipfile.ZIP_DEFLATED) as zipf:
             zipf.write(mp3_file, 'final_audio.mp3')
             if os.path.exists(timestamps_file):
                 zipf.write(timestamps_file, 'timestamps.json')
             zipf.write(text_file, 'book_text.txt')
             zipf.write(speakers_metadata_file, 'speakers_metadata.json')
-        
+
         # Mark job as completed
         with job_lock:
             job_data = active_jobs.pop(job_id)
@@ -866,9 +889,9 @@ def process_conversion_async(job_id, clean_text, book_title):
                 'completed_at': time.time(),
                 'started_at': job_data['started_at']
             }
-        
+
         print(f"✅ Async conversion completed for job {job_id}")
-        
+
     except Exception as e:
         print(f"❌ Async conversion failed for job {job_id}: {e}")
         with job_lock:
@@ -910,7 +933,7 @@ def convert_text_to_audio_async():
         print("\n" + "="*50)
         print("📝 ASYNC CONVERSION REQUEST")
         print("="*50)
-        
+
         # Parse request
         data = request.get_json(silent=True)
         if not data:
@@ -927,19 +950,19 @@ def convert_text_to_audio_async():
         if not data or 'text' not in data:
             print("   No 'text' in request body")
             return jsonify({"error": "No text provided"}), 400
-        
+
         clean_text = data['text']
         book_title = data.get('title', 'book')
-        
+
         print(f"📖 Book: {book_title}")
         print(f"📊 Length: {len(clean_text)} characters")
-        
-        if len(clean_text) > 500000:
-            return jsonify({"error": "Text too long. Max 500k chars"}), 400
-        
+
+        #if len(clean_text) > 500000:
+            #return jsonify({"error": "Text too long. Max 500k chars"}), 400
+
         # Generate job ID
         job_id = str(uuid_lib.uuid4())
-        
+
         # Store job info
         with job_lock:
             active_jobs[job_id] = {
@@ -949,18 +972,18 @@ def convert_text_to_audio_async():
                 'text_length': len(clean_text),
                 'started_at': time.time()
             }
-        
+
         # Start async processing
         conversion_executor.submit(process_conversion_async, job_id, clean_text, book_title)
-        
+
         print(f"✅ Job {job_id} queued for async processing")
-        
+
         return jsonify({
             "job_id": job_id,
             "status": "queued",
             "message": "Conversion started. Use /status/<job_id> to check progress."
         })
-        
+
     except Exception as e:
         print(f"\n❌ ERROR: {e}")
         traceback.print_exc()
@@ -982,7 +1005,7 @@ def get_job_status(job_id):
                     "started_at": job_data['started_at'],
                     "elapsed_time": time.time() - job_data['started_at']
                 })
-            
+
             # Check completed jobs
             if job_id in completed_jobs:
                 job_data = completed_jobs[job_id]
@@ -994,16 +1017,16 @@ def get_job_status(job_id):
                     "completed_at": job_data['completed_at'],
                     "total_time": job_data['completed_at'] - job_data['started_at']
                 }
-                
+
                 if job_data['status'] == 'failed':
                     response['error'] = job_data['error']
                 else:
                     response['download_url'] = f"/download/{job_id}"
-                
+
                 return jsonify(response)
-        
+
         return jsonify({"error": "Job not found"}), 404
-        
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1014,26 +1037,26 @@ def download_converted_file(job_id):
         with job_lock:
             if job_id not in completed_jobs:
                 return jsonify({"error": "Job not found or not completed"}), 404
-            
+
             job_data = completed_jobs[job_id]
-            
+
             if job_data['status'] != 'completed':
                 return jsonify({"error": "Job not completed successfully"}), 400
-            
+
             zip_file = job_data['zip_file']
-            
+
             if not os.path.exists(zip_file):
                 return jsonify({"error": "Converted file not found"}), 404
-            
+
             title = job_data['title']
-            
+
             return send_file(
                 zip_file,
                 mimetype='application/zip',
                 as_attachment=True,
                 download_name=f"{title.replace(' ', '_')}_converted.zip"
             )
-    
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
